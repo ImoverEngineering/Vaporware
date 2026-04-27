@@ -1,0 +1,22 @@
+# Build outputs
+examples/*/build/
+
+# Generated OpenOCD flash script (produced by gen_direct_flash.py)
+direct_flash.tcl
+
+# Compiled simulation binaries
+examples/slots/sim/slots_sim
+
+# Device firmware backups (proprietary -- see docs/FIRMWARE_DUMP.md)
+firmware/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.swp
+*~
