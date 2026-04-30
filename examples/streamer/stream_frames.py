@@ -47,6 +47,12 @@ import subprocess
 import sys
 import time
 
+try:
+    import numpy as np
+    HAS_NUMPY = True
+except ImportError:
+    HAS_NUMPY = False
+
 # ── Dependencies check ────────────────────────────────────────────────────────
 try:
     from PIL import Image, ImageGrab
@@ -63,29 +69,34 @@ except ImportError:
 # ── Protocol ──────────────────────────────────────────────────────────────────
 CTRL_ADDR  = 0x20000010   # legacy: reset / sleep
 
-# Double-buffer A
+# Half-resolution double-buffer: 64×80 logical pixels, 2× scaled by MCU to 128×160.
+# 4× fewer bytes per frame vs full-res → ~4× more fps for all-dirty frames.
+#
+# Double-buffer A  (1024 B pixel data)
 BUF_A_IDX_ADDR  = 0x20000100
-BUF_A_DATA_ADDR = 0x20000104   # IDX_A(4) + 2048 bytes pixel data
-BUF_A_TRIG_ADDR = 0x20000904   # IDX_A(4) + BUF_A(2048) past BUF_A_IDX_ADDR
+BUF_A_DATA_ADDR = 0x20000104   # IDX_A(4) + 1024 bytes pixel data
+BUF_A_TRIG_ADDR = 0x20000504   # IDX_A(4) + BUF_A(1024) past BUF_A_IDX_ADDR
 
-# Double-buffer B
-BUF_B_IDX_ADDR  = 0x20000908
-BUF_B_DATA_ADDR = 0x2000090C   # IDX_B(4) + 2048 bytes pixel data
-BUF_B_TRIG_ADDR = 0x2000110C   # IDX_B(4) + BUF_B(2048) past BUF_B_IDX_ADDR
+# Double-buffer B  (1024 B pixel data)
+BUF_B_IDX_ADDR  = 0x20000508
+BUF_B_DATA_ADDR = 0x2000050C   # IDX_B(4) + 1024 bytes pixel data
+BUF_B_TRIG_ADDR = 0x2000090C   # IDX_B(4) + BUF_B(1024) past BUF_B_IDX_ADDR
 
 # Combined packet sizes:
-#   Packet A: IDX_A(4) + BUF_A(2048) + TRIG_A(4) = 2056 B  @ BUF_A_IDX_ADDR
-#   Packet B: IDX_B(4) + BUF_B(2048) + TRIG_B(4) = 2056 B  @ BUF_B_IDX_ADDR
-BUF_CHUNK_BYTES = 2048    # pixel bytes per chunk (128 x 8 x 2)
-FULL_PACKET     = 2056    # IDX(4) + BUF(2048) + TRIG(4)
+#   Packet A/B: IDX(4) + BUF(1024) + TRIG(4) = 1032 B
+#   At 91 KB/s: ~11 ms per full chunk; 10 chunks all dirty → ~113 ms → ~9 fps
+#   MCU draw_chunk_2x at 24 MHz SPI: ~1.4 ms → always done before PC revisits
+BUF_CHUNK_BYTES = 1024    # pixel bytes per chunk (64 x 8 x 2)
+FULL_PACKET     = 1032    # IDX(4) + BUF(1024) + TRIG(4)
 
 CTRL_IDLE  = 0x00000000
 CTRL_CHUNK = 0x000000CC
 CTRL_RESET = 0xDEAD0000
 CTRL_SLEEP = 0xDEAD0001
 
-CHUNK_ROWS = 8
-NUM_CHUNKS = 20
+CHUNK_ROWS  = 8     # logical rows per chunk
+CHUNK_W     = 64    # logical pixels per row (MCU 2× scales to 128)
+NUM_CHUNKS  = 10    # 10 × 8 logical rows = 80 → 160 display rows
 LCD_W, LCD_H = 128, 160
 
 # ── OpenOCD / WSL config ──────────────────────────────────────────────────────
@@ -103,18 +114,41 @@ OCD_TELNET_PORT = 4444
 
 # ── Color conversion ──────────────────────────────────────────────────────────
 def image_to_chunks(img):
-    """Convert any PIL Image → 20 raw chunk byte-strings (2048 B each, BGR565 LE)."""
-    img = img.convert("RGB").resize((LCD_W, LCD_H), Image.LANCZOS)
-    data = img.tobytes()
+    """Convert any PIL Image → NUM_CHUNKS raw chunk byte-strings (BGR565 LE).
 
+    Image is downscaled to CHUNK_W × (NUM_CHUNKS*CHUNK_ROWS) logical pixels.
+    The MCU 2× scales each chunk back to full display resolution via
+    display_draw_chunk_2x(), so 64×80 logical → 128×160 on-screen.
+
+    Uses numpy for vectorised BGR565 conversion (~50× faster than a Python loop).
+    Falls back to a pure-Python loop if numpy is not available.
+    """
+    log_h = NUM_CHUNKS * CHUNK_ROWS   # 80 logical rows
+    # BILINEAR is 3-5× faster than LANCZOS and indistinguishable at 64×80
+    img = img.convert("RGB").resize((CHUNK_W, log_h), Image.BILINEAR)
+
+    if HAS_NUMPY:
+        arr = np.frombuffer(img.tobytes(), dtype=np.uint8).reshape(log_h, CHUNK_W, 3)
+        r = arr[:, :, 0].astype(np.uint16)
+        g = arr[:, :, 1].astype(np.uint16)
+        b = arr[:, :, 2].astype(np.uint16)
+        # BGR565 little-endian: bits [15:11]=B [10:5]=G [4:0]=R
+        bgr565 = ((b >> 3) << 11) | ((g >> 2) << 5) | (r >> 3)
+        raw = bgr565.astype('<u2').tobytes()   # already LE on x86
+        chunk_bytes = CHUNK_W * CHUNK_ROWS * 2
+        return [raw[ci * chunk_bytes:(ci + 1) * chunk_bytes]
+                for ci in range(NUM_CHUNKS)]
+
+    # Pure-Python fallback
+    data = img.tobytes()
     chunks = []
     for ci in range(NUM_CHUNKS):
         row0 = ci * CHUNK_ROWS
-        buf = bytearray(LCD_W * CHUNK_ROWS * 2)
+        buf = bytearray(CHUNK_W * CHUNK_ROWS * 2)
         off = 0
         for row in range(CHUNK_ROWS):
-            src = ((row0 + row) * LCD_W) * 3
-            for col in range(LCD_W):
+            src = ((row0 + row) * CHUNK_W) * 3
+            for col in range(CHUNK_W):
                 r = data[src];     src += 1
                 g = data[src];     src += 1
                 b = data[src];     src += 1
@@ -615,8 +649,14 @@ def window_frames(title):
             win32gui.ReleaseDC(hwnd, hwnd_dc)
             yield img
         except Exception as e:
-            print(f"\n  Window capture error: {e}")
-            time.sleep(0.1)
+            # SDL2 / fullscreen games recreate their window handle on mode switches.
+            # Re-find the window and keep going rather than printing errors forever.
+            new_hwnd = find_window(title)
+            if new_hwnd and new_hwnd != hwnd:
+                hwnd = new_hwnd
+                print(f"\n  Window handle refreshed: '{win32gui.GetWindowText(hwnd)}'")
+            else:
+                time.sleep(0.1)
 
 
 def file_frames(path):
@@ -660,7 +700,7 @@ def main():
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument("--test",   action="store_true",
                       help="Animated rainbow test pattern")
-    mode.add_argument("--screen", nargs="*", metavar=("X","Y","W","H"),
+    mode.add_argument("--screen", nargs="*", metavar="X Y W H",
                       help="Capture screen region [x y w h] (default: full monitor)")
     mode.add_argument("--window", metavar="TITLE",
                       help="Capture window by title substring (Windows only)")

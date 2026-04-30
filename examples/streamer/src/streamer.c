@@ -4,26 +4,26 @@
  * baseline.  The only addition is the SWD streaming protocol loop in place of
  * the game loop.
  *
- * Clock: 8 MHz HSI, no PLL.  SPI1 runs at 4 MHz (BR_DIV2 of APB2=8MHz).
- *   Each 128×8 chunk blits in ~4 ms.  PLL boost (24 MHz SPI) is deferred
- *   until we verify the physical board handles higher SPI speeds.
+ * Clock: 8 MHz HSI throughout.  SPI1 at 4 MHz (BR_DIV2 of APB2=8MHz).
+ *   SPI speed experiments: 24 MHz (PLL/BR_DIV2) and 12 MHz (PLL/BR_DIV4) both
+ *   cause flashing white/black display — the PCB trace geometry limits reliable
+ *   SPI to 4 MHz regardless of the GC9107 spec (which allows 32 MHz).
  *
- * Double-buffer SRAM layout — two ping-pong buffers of 128×8 rows each:
+ * Half-resolution double-buffer layout — 64×80 logical pixels, 2× scaled:
  *
- *   CTRL       @ 0x20000010  0xDEAD0000 = reset display    (4 bytes)
- *   IDX_A      @ 0x20000100  chunk index for buffer A       (4 bytes)
- *   BUF_A      @ 0x20000104  pixel data 128×8×2 B = 2048 B (2048 bytes)
- *   TRIG_A     @ 0x20000904  0xCC = buffer A ready          (4 bytes) <- written LAST
- *   IDX_B      @ 0x20000908  chunk index for buffer B       (4 bytes)
- *   BUF_B      @ 0x2000090C  pixel data 128×8×2 B = 2048 B (2048 bytes)
- *   TRIG_B     @ 0x2000110C  0xCC = buffer B ready          (4 bytes) <- written LAST
+ *   CTRL       @ 0x20000010  0xDEAD0000 = reset display     (4 bytes)
+ *   IDX_A      @ 0x20000100  chunk index for buffer A        (4 bytes)
+ *   BUF_A      @ 0x20000104  64×8 logical px = 1024 B        (1024 bytes)
+ *   TRIG_A     @ 0x20000504  0xCC = buffer A ready           (4 bytes) <- written LAST
+ *   IDX_B      @ 0x20000508  chunk index for buffer B        (4 bytes)
+ *   BUF_B      @ 0x2000050C  64×8 logical px = 1024 B        (1024 bytes)
+ *   TRIG_B     @ 0x2000090C  0xCC = buffer B ready           (4 bytes) <- written LAST
  *
- * PC sends a 2056-byte packet [IDX(4)][BUF(2048)][TRIG(4)] per buffer.
- * TRIG is the last word written so MCU cannot fire before BUF is ready.
- * MCU polls both TRIG_A and TRIG_B in a tight loop, drawing whichever fires.
- * With 1.4 ms MCU draw time vs ~22 ms PC write time, no explicit handshake needed.
+ * MCU calls display_draw_chunk_2x() — scales 64×8 → 128×16 display pixels.
+ * At 12 MHz SPI each 128×16 blit takes ~2.7 ms vs ~11 ms PC write of 1032 B.
+ * MCU is always done long before PC revisits the same buffer — no handshake.
  *
- * Stack: 0x20002000 (top) down — ~3824 B available.
+ * Stack: 0x20002000 (top) down — ~7408 B available (plenty).
  */
 
 #include "n32g031.h"
@@ -34,23 +34,24 @@
 /* Legacy control word */
 #define CTRL  ((volatile uint32_t *)0x20000010UL)
 
-/* Buffer A */
+/* Buffer A — 64×8 logical pixels = 1024 bytes */
 #define IDX_A  ((volatile uint32_t *)0x20000100UL)
 #define BUF_A  ((const uint16_t     *)0x20000104UL)
-#define TRIG_A ((volatile uint32_t *)0x20000904UL)
+#define TRIG_A ((volatile uint32_t *)0x20000504UL)
 
-/* Buffer B */
-#define IDX_B  ((volatile uint32_t *)0x20000908UL)
-#define BUF_B  ((const uint16_t     *)0x2000090CUL)
-#define TRIG_B ((volatile uint32_t *)0x2000110CUL)
+/* Buffer B — 64×8 logical pixels = 1024 bytes */
+#define IDX_B  ((volatile uint32_t *)0x20000508UL)
+#define BUF_B  ((const uint16_t     *)0x2000050CUL)
+#define TRIG_B ((volatile uint32_t *)0x2000090CUL)
 
 #define CTRL_IDLE  0x00000000UL
 #define CTRL_CHUNK 0x000000CCUL
 #define CTRL_RESET 0xDEAD0000UL
 #define CTRL_SLEEP 0xDEAD0001UL
 
-#define CHUNK_ROWS  8u
-#define NUM_CHUNKS 20u
+#define CHUNK_ROWS  8u    /* logical rows per chunk */
+#define CHUNK_W    64u    /* logical pixels per row (display_draw_chunk_2x scales to 128) */
+#define NUM_CHUNKS 10u    /* 10 × 8 logical rows = 80 → 160 display rows after 2× scale */
 
 /* draw_waiting — shown at startup while waiting for the PC to start streaming.
  * Fills the entire screen bright magenta so it is unmistakable; overlays three
@@ -87,7 +88,7 @@ int main(void)
     /* ── Core hardware init (identical to flappy.c) ─────────────────────── */
     clock_init();              /* 8 MHz HSI, TIM3 PSC=7 → 1 ms ticks         */
     delay_ms(50);
-    display_init();            /*  4 MHz SPI — 128×8 chunk blits in ~4 ms    */
+    display_init();            /* 4 MHz SPI — hard limit of this board's traces*/
     display_set_backlight(80);
     tim1_init();
     bat_init();            /* ADC init — included because flappy includes it  */
@@ -122,13 +123,12 @@ int main(void)
             continue;
         }
 
-        /* Buffer A: PC has written IDX_A + BUF_A then set TRIG_A last.
-         * MCU reads IDX and blits BUF_A to the correct screen row. */
+        /* Buffer A: 64×8 logical chunk, 2× scaled to 128×16 display pixels. */
         if (*TRIG_A == CTRL_CHUNK) {
             uint32_t idx = *IDX_A;
             if (idx < NUM_CHUNKS) {
-                uint16_t row_start = (uint16_t)(idx * CHUNK_ROWS);
-                display_draw_chunk_cpu(BUF_A, row_start, CHUNK_ROWS);
+                uint16_t log_row = (uint16_t)(idx * CHUNK_ROWS);
+                display_draw_chunk_2x(BUF_A, log_row, CHUNK_W, CHUNK_ROWS);
             }
             *TRIG_A = CTRL_IDLE;
         }
@@ -137,8 +137,8 @@ int main(void)
         if (*TRIG_B == CTRL_CHUNK) {
             uint32_t idx = *IDX_B;
             if (idx < NUM_CHUNKS) {
-                uint16_t row_start = (uint16_t)(idx * CHUNK_ROWS);
-                display_draw_chunk_cpu(BUF_B, row_start, CHUNK_ROWS);
+                uint16_t log_row = (uint16_t)(idx * CHUNK_ROWS);
+                display_draw_chunk_2x(BUF_B, log_row, CHUNK_W, CHUNK_ROWS);
             }
             *TRIG_B = CTRL_IDLE;
         }
