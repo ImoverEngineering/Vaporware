@@ -85,7 +85,7 @@ typedef struct {
 #define RCC_APB2ENR_IOPBEN  (1UL << 3)  /* GPIOB clock */
 #define RCC_APB2ENR_IOPCEN  (1UL << 4)  /* GPIOC clock */
 #define RCC_APB2ENR_SPI1EN  (1UL << 9)  /* SPI1 clock — bit 9 (NOT bit 12 like STM32F1) */
-#define RCC_APB2ENR_TIM1EN  (1UL << 11) /* TIM1 clock — advanced timer, used as 1kHz wall clock */
+#define RCC_APB2ENR_TIM1EN  (1UL << 12) /* TIM1 clock — advanced timer, used as 1kHz wall clock (bit 12, NOT 11 — confirmed by OpenOCD register scan on Raz DC25000) */
 #define RCC_APB2ENR_USART1EN (1UL << 14)
 
 /* RCC_APB1ENR bits (register at RCC_BASE+0x1C = 0x4002101C) */

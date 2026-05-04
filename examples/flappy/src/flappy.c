@@ -33,7 +33,7 @@
  *
  * DISPLAY SLEEP:
  *   After DIM_MS (5s) idle: backlight dims to value 15 (gc9107_set_backlight(15)).
- *   After SLEEP_MS (12s) idle: full LCD sleep via gc9107_sleep_in(), all GPIO high-Z.
+ *   After SLEEP_MS (30s) idle: full LCD sleep via gc9107_sleep_in(), all GPIO high-Z.
  *   SWD pins (PA13/PA14) remain in AF mode during sleep for debugger access.
  *
  * Build: compile with -DFLAPPY_BIRD; exclude main.c / tamagotchi.c / slots.c
@@ -183,16 +183,25 @@ static const uint8_t g_bldg[128] = {
 
 /* ===================================================================
  * Physics  (1/8-pixel fixed-point, 125 Hz)
+ *
+ * At 125 Hz (PHYS_MS=8ms) each tick is 8ms.  The play area is 136px
+ * (PIPE_TOP=14 to GROUND_Y=150).  Values chosen so the bird feels
+ * floaty but responsive:
+ *   GRAVITY_FP=4  → 0.5 px/tick²
+ *   FLAP_FP=-40   → −5 px/tick initial rise; ~27px arc per flap (~330ms)
+ *   MAX_FALL_FP=20 → 2.5 px/tick terminal velocity
+ * PHYS_MS=33ms locks to exactly 1 tick per APP_FRAME_MS=33ms frame →
+ * perfectly smooth motion with no inter-frame jitter.
  * =================================================================== */
 #define FP_SHIFT     3
-#define GRAVITY_FP   4
-#define FLAP_FP      (-48)
-#define MAX_FALL_FP  48
-#define PHYS_MS      8u
+#define GRAVITY_FP   3
+#define FLAP_FP      (-36)
+#define MAX_FALL_FP  40
+#define PHYS_MS      33u
 
 /* Inactivity timeouts (milliseconds, each ≤ 65535) */
 #define DIM_MS        5000u   /* dim backlight after this many ms idle */
-#define SLEEP_MS     12000u   /* screen off (LCD sleep) after this many ms idle */
+#define SLEEP_MS     30000u   /* screen off (LCD sleep) after this many ms idle */
 
 /* ===================================================================
  * RNG
@@ -701,7 +710,6 @@ static void game_init_state(void)
     g_prev_score = 0xFFFFFFFFUL;
     g_dead_hold  = 0;
     g_new_hisc   = 0;
-    g_phys_t     = ms_now();
 
     pipe_reset(0, (int16_t)(PIPE_START_X));
     pipe_reset(1, (int16_t)(PIPE_START_X + PIPE_SEP));
@@ -709,6 +717,7 @@ static void game_init_state(void)
     scene_draw(g_bird_y, g_vel_fp, 0);
     draw_waiting_hint();
     g_prev_score = 0;
+    g_phys_t     = ms_now();  /* reset AFTER render so no catch-up burst */
 }
 
 /* ===================================================================
@@ -728,7 +737,7 @@ static void on_hard_reset(void)
  * =================================================================== */
 void app_init(void)
 {
-    app_set_sleep_timeout(12000);          /* sleep after 12 s idle  */
+    app_set_sleep_timeout(30000);          /* sleep after 30 s idle  */
     app_set_hold_reset(10000, on_hard_reset); /* hold 10 s → reset    */
 
     g_high_score = nv_read(NV_KEY_HIGH_SCORE, 0);
@@ -758,20 +767,55 @@ void app_update(uint32_t frame)
         draw_bat();
     }
 
-    /* Latch button edge once per frame — consumed in first tick that needs it */
-    uint8_t flap = button_just_pressed();
+    /* Sticky flap latch: set on the rising edge of a button press,
+     * cleared ONLY when a physics tick actually consumes it.
+     *
+     * Why sticky?  If g_phys_t was just reset (transition or death/restart),
+     * the immediately-following app_update() may run 0 physics ticks while
+     * still seeing a new button edge.  A plain per-frame latch would lose that
+     * edge on the next call (s_btn_prev=1, no new rising edge → flap=0).
+     * Making the latch sticky means the press is held in s_flap until the
+     * next physics frame can act on it.
+     *
+     * Holding the button gives one flap per press: once the latch is cleared
+     * by a tick, no new rising edge fires while the button is still down. */
+    static uint8_t s_btn_prev = 0u;
+    static uint8_t s_flap     = 0u;   /* cleared by physics, not by frame */
+    {
+        uint8_t btn_cur = button_raw();
+        if (btn_cur && !s_btn_prev) s_flap = 1u;   /* new rising edge */
+        s_btn_prev = btn_cur;
+    }
+    uint8_t flap = s_flap;   /* local alias used throughout the loop */
 
-    /* Run physics catch-up: process all pending 8ms ticks */
-    while ((uint16_t)(ms_now() - g_phys_t) >= PHYS_MS) {
+    /* Run physics catch-up: process pending 8ms ticks, cap at 4 per frame
+     * so app_update() exits regularly and button_update() can run again.
+     * Per-tick button_raw() sampling catches presses that happen during
+     * SPI rendering (~8ms/tick) when button_update() isn't being called. */
+    uint8_t ticks_this_frame = 0u;
+    while (ticks_this_frame < 4u && (uint16_t)(ms_now() - g_phys_t) >= PHYS_MS) {
+        ticks_this_frame++;
         g_phys_t += PHYS_MS;
+
+        /* Re-sample GPIO each tick; update s_flap and the local flap alias. */
+        {
+            uint8_t btn = button_raw();
+            if (btn && !s_btn_prev) s_flap = 1u;
+            s_btn_prev = btn;
+            flap = s_flap;
+        }
 
         /* ---- Waiting ---- */
         if (g_state == ST_WAITING) {
-            if (flap) {
+            /* Use button_pressed() (held) here so a normal press always
+             * registers — button_just_pressed() can be missed if the press
+             * is shorter than one frame or if there's an edge-detect issue. */
+            if (flap || button_pressed()) {
                 g_state  = ST_PLAYING;
                 g_vel_fp = FLAP_FP;
-                scene_draw(g_bird_y, g_vel_fp, g_score); /* wipe hint */
-                flap = 0;
+                scene_draw(g_bird_y, g_vel_fp, g_score); /* wipe hint (~100ms) */
+                g_phys_t = ms_now();  /* reset AFTER render so no catch-up burst */
+                flap = 0; s_flap = 0u; /* consume */
             }
             continue;
         }
@@ -783,6 +827,7 @@ void app_update(uint32_t frame)
                     nv_write(NV_KEY_HIGH_SCORE, g_high_score);
                     g_new_hisc = 0;
                 }
+                s_flap = 0u;   /* consume before reinit */
                 game_init_state();
                 return;   /* g_phys_t was reset; skip remaining ticks */
             }
@@ -790,7 +835,7 @@ void app_update(uint32_t frame)
         }
 
         /* ---- Playing — physics + differential render ---- */
-        if (flap) { g_vel_fp = FLAP_FP; flap = 0; }
+        if (flap) { g_vel_fp = FLAP_FP; flap = 0; s_flap = 0u; }
         g_vel_fp += GRAVITY_FP;
         if (g_vel_fp > MAX_FALL_FP) g_vel_fp = MAX_FALL_FP;
         g_bird_fp += g_vel_fp;
