@@ -19,13 +19,12 @@
  *   During display_sleep() and flash writes the IWDG is also fed inside the
  *   respective busy-wait loops.
  *
- * COIL SAFETY — PA4/PA5/PA6 driven LOW at startup:
- *   The first thing main() does (before clock_init) is configure PA4, PA5, PA6
- *   as output LOW.  These pins are NOT the coil on production Raz DC25000 boards
- *   (PB0 is the confirmed coil gate), but earlier hardware revisions or unknown
- *   variants may wire the coil differently.  Driving these LOW costs nothing and
- *   prevents accidental coil activation if the firmware is loaded onto a variant
- *   board.  PA7 (button) is left as input and is configured separately.
+ * DISPLAY POWER ENABLE — PA4/PA5/PA6 driven LOW:
+ *   The framework's display_gpio_init() configures PA4, PA5, PA6 as GPIO outputs
+ *   driven LOW.  One of these pins is the display module power enable (active-LOW);
+ *   without it, the GC9107 receives SPI commands but shows nothing.  Confirmed by
+ *   disassembly of the factory slots firmware (restore_slots.bin).  This is now
+ *   handled in the Vaporware SDK (display.c) — apps do not need to set these.
  *
  * HIGH SCORE STORAGE:
  *   Uses a private write-forward scheme at flash page 0x0800FC00 (1 KB, 256 slots).
