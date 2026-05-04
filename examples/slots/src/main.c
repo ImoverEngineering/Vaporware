@@ -27,7 +27,10 @@ void app_init(void) {
 }
 
 void app_update(uint32_t frame) {
-    slots_update(frame, button_just_pressed());
+    /* button_raw() reads GPIO directly every frame — catches presses that
+     * occur during long renders when button_update() hasn't run yet.
+     * slots_update() does its own edge detection via g_last_btn. */
+    slots_update(frame, button_raw());
 }
 
 void app_wake(void) {
