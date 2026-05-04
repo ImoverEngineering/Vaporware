@@ -23,6 +23,9 @@
 #define LCD_RST_HIGH()  GPIO_SET(LCD_RST_PORT, LCD_RST_PIN)
 
 static void spi_write_byte(uint8_t byte) {
+    /* Hardware SPI1: Mode 0 (CPOL=0 CPHA=0), CR1=0x0344, PCLK/2=4MHz.
+     * Confirmed from slots binary disassembly and live CR1 readback at runtime.
+     * Bit-bang was tried and does not work on this hardware. */
     while (!(SPI1->SR & SPI_SR_TXE));
     *(volatile uint8_t *)&SPI1->DR = byte;
     while (SPI1->SR & SPI_SR_BSY);
@@ -39,6 +42,7 @@ static void lcd_write_data(uint8_t data) {
 }
 
 static void display_gpio_init(void) {
+    /* Enable GPIOA + GPIOB + SPI1 clocks */
     RCC->APB2ENR |= RCC_APB2ENR_IOPAEN | RCC_APB2ENR_IOPBEN | RCC_APB2ENR_SPI1EN;
 
     /* Backlight enable — active-LOW output, LOW = on at startup */
@@ -47,11 +51,12 @@ static void display_gpio_init(void) {
     LCD_BL_PORT->OTYPER &= ~(1UL << LCD_BL_PIN);
     LCD_BL_PORT->BSRR   =  (1UL << (LCD_BL_PIN + 16));  /* LOW = on */
 
-    /* SPI1_SCK, SPI1_MOSI — AF0 */
+    /* SPI1_SCK (PB3) SPI1_MOSI (PB5) — AF0 (hardware SPI1) */
     LCD_SCK_PORT->MODER  &= ~((3UL << (LCD_SCK_PIN  * 2)) | (3UL << (LCD_MOSI_PIN * 2)));
     LCD_SCK_PORT->MODER  |=  ((GPIO_MODE_AF << (LCD_SCK_PIN  * 2)) |
                                (GPIO_MODE_AF << (LCD_MOSI_PIN * 2)));
     LCD_SCK_PORT->AFRL   &= ~((0xFUL << (LCD_SCK_PIN  * 4)) | (0xFUL << (LCD_MOSI_PIN * 4)));
+    /* AF0 = 0: no bits to set */
     LCD_SCK_PORT->OTYPER &= ~((1UL << LCD_SCK_PIN) | (1UL << LCD_MOSI_PIN));
     LCD_SCK_PORT->OSPEEDR|=  (GPIO_SPEED_HIGH << (LCD_SCK_PIN  * 2)) |
                               (GPIO_SPEED_HIGH << (LCD_MOSI_PIN * 2));
@@ -74,9 +79,20 @@ static void display_gpio_init(void) {
     LCD_DC_DATA();
     LCD_RST_HIGH();
 
-    /* SPI1: master, mode 0 (CPOL=0 CPHA=0), 8-bit, APB2/2, software NSS */
-    SPI1->CR1 = SPI_CR1_MSTR | SPI_CR1_SSM | SPI_CR1_SSI |
-                SPI_CR1_BR_DIV2 | SPI_CR1_SPE;
+    /* PA4, PA5, PA6 — driven LOW to match slots firmware.
+     * One of these is a display module power enable (active-LOW).
+     * Without this, GC9107 receives SPI commands but shows nothing.
+     * Confirmed by disassembling restore_slots.bin: GPIOA_ODR=0, PA4/5/6=output. */
+    GPIOA->MODER &= ~((3UL << (4*2)) | (3UL << (5*2)) | (3UL << (6*2)));
+    GPIOA->MODER |=  ((GPIO_MODE_OUTPUT << (4*2)) |
+                      (GPIO_MODE_OUTPUT << (5*2)) |
+                      (GPIO_MODE_OUTPUT << (6*2)));
+    GPIOA->OTYPER &= ~((1UL << 4) | (1UL << 5) | (1UL << 6));
+    GPIOA->BSRR = (1UL << (4+16)) | (1UL << (5+16)) | (1UL << (6+16)); /* LOW */
+
+    /* SPI1: Mode 0 (CPOL=0 CPHA=0), master, PCLK/2=4MHz, SSM+SSI, SPE.
+     * CR1=0x0344 confirmed from slots binary CR1 readback at runtime. */
+    SPI1->CR1 = 0x0344UL;
     SPI1->CR2 = 0;
 }
 
@@ -228,12 +244,10 @@ void display_fill(uint16_t color) {
     display_set_window(0, 0, LCD_WIDTH - 1, LCD_HEIGHT - 1);
     LCD_DC_DATA();
     for (uint32_t i = 0; i < (uint32_t)LCD_WIDTH * LCD_HEIGHT; i++) {
-        while (!(SPI1->SR & SPI_SR_TXE));
-        *(volatile uint8_t *)&SPI1->DR = hi;
-        while (!(SPI1->SR & SPI_SR_TXE));
-        *(volatile uint8_t *)&SPI1->DR = lo;
+        if ((i & 0x1FF) == 0) IWDG_FEED();   /* feed every 512 pixels */
+        spi_write_byte(hi);
+        spi_write_byte(lo);
     }
-    while (SPI1->SR & SPI_SR_BSY);
     LCD_CS_HIGH();
 }
 
@@ -243,12 +257,10 @@ void display_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t 
     display_set_window(x, y, x + w - 1, y + h - 1);
     LCD_DC_DATA();
     for (uint32_t i = 0; i < (uint32_t)w * h; i++) {
-        while (!(SPI1->SR & SPI_SR_TXE));
-        *(volatile uint8_t *)&SPI1->DR = hi;
-        while (!(SPI1->SR & SPI_SR_TXE));
-        *(volatile uint8_t *)&SPI1->DR = lo;
+        if ((i & 0x1FF) == 0) IWDG_FEED();   /* feed every 512 pixels */
+        spi_write_byte(hi);
+        spi_write_byte(lo);
     }
-    while (SPI1->SR & SPI_SR_BSY);
     LCD_CS_HIGH();
 }
 
@@ -259,13 +271,11 @@ void display_draw_image(const uint16_t *img, uint16_t x, uint16_t y,
     LCD_DC_DATA();
     uint32_t npix = (uint32_t)w * h;
     for (uint32_t i = 0; i < npix; i++) {
+        if ((i & 0x1FF) == 0) IWDG_FEED();   /* feed every 512 pixels */
         uint16_t px = img[i];
-        while (!(SPI1->SR & SPI_SR_TXE));
-        *(volatile uint8_t *)&SPI1->DR = px >> 8;
-        while (!(SPI1->SR & SPI_SR_TXE));
-        *(volatile uint8_t *)&SPI1->DR = px & 0xFF;
+        spi_write_byte(px >> 8);
+        spi_write_byte(px & 0xFF);
     }
-    while (SPI1->SR & SPI_SR_BSY);
     LCD_CS_HIGH();
 }
 
@@ -299,6 +309,5 @@ void display_draw_pixel(uint16_t x, uint16_t y, uint16_t color) {
     LCD_DC_DATA();
     spi_write_byte(color >> 8);
     spi_write_byte(color & 0xFF);
-    while (SPI1->SR & SPI_SR_BSY);
     LCD_CS_HIGH();
 }
