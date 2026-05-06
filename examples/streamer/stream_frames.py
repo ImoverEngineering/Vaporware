@@ -377,20 +377,6 @@ class VapeDisplay:
         )
         self._read_prompt()
 
-    def _wait_trig_clear(self):
-        """Poll FAST_TRIG until the MCU clears it (finished drawing the chunk).
-
-        After TRIG=0xCC the MCU does a SPI blit (~8 ms at 4 MHz SPI).
-        We must not overwrite FAST_BUF until the MCU finishes reading it.
-        One mrw round-trip is usually enough — prompt collection already
-        takes ~10-15 ms, by which time the MCU has typically already cleared.
-        """
-        deadline = time.monotonic() + 0.080
-        while time.monotonic() < deadline:
-            resp = self._cmd(f'mrw 0x{FAST_TRIG_ADDR:08X}')
-            if '0xcc' not in resp.lower():
-                return
-
     def send_frame(self, chunks):
         """Send all changed chunks. Returns (elapsed_seconds, chunks_sent)."""
         t0 = time.monotonic()
@@ -402,7 +388,6 @@ class VapeDisplay:
             self._prev_chunks[idx] = chunk
             self._send_chunk(idx, chunk)
             chunks_sent += 1
-            self._wait_trig_clear()
 
         return time.monotonic() - t0, chunks_sent
 
