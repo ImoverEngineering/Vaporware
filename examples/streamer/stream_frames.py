@@ -352,75 +352,30 @@ class VapeDisplay:
         self._wsl_writer.stdin.flush()
         self._wsl_writer.stdout.readline()   # block until sidecar acks
 
-    def _send_chunk(self, idx, chunk, prev_chunk=None):
-        """Write one chunk to the MCU, sending only the changed byte range.
+    def _send_chunk(self, idx, chunk):
+        """Write one chunk to the MCU via a single load_image.
 
-        If prev_chunk is provided, trims unchanged leading/trailing words to
-        reduce the load_image payload.  Only writes the region [trim_start,
-        trim_end) within FAST_BUF rather than all 4096 bytes.
+        Always sends the full [IDX(4)][BUF(4096)][TRIG(4)] packet in one
+        load_image to 0x20000100.  TRIG is the last word written, so the MCU
+        cannot fire before BUF is fully resident in SRAM.
 
-        Break-even analysis: trimmed path adds ~4 ms overhead (two extra mww
-        round-trips for IDX and TRIG instead of the combined packet).  The
-        trimmed path is only taken when the partial payload is small enough
-        that the USB transfer savings outweigh that overhead (~3731 bytes).
+        A delta / trim optimisation is NOT used here because FAST_BUF is a
+        single shared buffer reused across all 10 chunk indices.  By the time
+        chunk i comes around again in the next frame, FAST_BUF contains the
+        last chunk written (chunk 9), not chunk i's previous data — so writing
+        only a delta would corrupt the draw.
 
         SRAM layout (contiguous):
           0x20000100  FAST_IDX  (4 bytes)
           0x20000104  FAST_BUF  (4096 bytes)
           0x20001104  FAST_TRIG (4 bytes)  ← written LAST; MCU fires only after BUF ready
         """
-        WORD = 4  # alignment for SWD bulk writes
-
-        # ── Compute changed range ─────────────────────────────────────────────
-        if prev_chunk is not None and len(prev_chunk) == len(chunk):
-            n = len(chunk)
-            trim_start = n   # will hold first changed word start
-            trim_end   = 0   # will hold last  changed word end
-            for i in range(0, n, WORD):
-                if chunk[i:i+WORD] != prev_chunk[i:i+WORD]:
-                    if trim_start == n:
-                        trim_start = i
-                    trim_end = i + WORD
-            if trim_start == n:
-                return  # no change (shouldn't reach here in send_frame)
-        else:
-            trim_start, trim_end = 0, len(chunk)
-
-        partial_len = trim_end - trim_start
-
-        # ── Choose write path ─────────────────────────────────────────────────
-        # Break-even: trimmed path costs +4 ms (two extra mww round-trips).
-        # Measured USB throughput: ~91 KB/s.  4 ms = ~364 bytes saved.
-        # Use trimmed path only when partial_len < full_len − 364 bytes.
-        FULL_PACKET = 4104  # IDX(4) + BUF(4096) + TRIG(4)
-        USE_TRIM = (partial_len < FULL_PACKET - 364)
-
-        if USE_TRIM:
-            # Partial write: write only the changed region of FAST_BUF, then
-            # set IDX and TRIG via separate mww commands.
-            # FAST_BUF already holds the previous full chunk for this idx;
-            # writing only the delta leaves unchanged pixels intact. ✓
-            partial = chunk[trim_start:trim_end]
-            self._sidecar_write(partial)
-            buf_addr = FAST_BUF_ADDR + trim_start
-            cmds = [
-                f'mww 0x{FAST_IDX_ADDR:08X} 0x{idx:08X}\n',
-                f'load_image {self._WSL_CHUNK_PATH} 0x{buf_addr:08X} bin\n',
-                f'mww 0x{FAST_TRIG_ADDR:08X} 0x{CTRL_CHUNK:08X}\n',
-            ]
-            for c in cmds:
-                self._sock.sendall(c.encode())
-            for _ in cmds:
-                self._read_prompt()
-        else:
-            # Full combined write: [IDX(4)][BUF(4096)][TRIG(4)] in one load_image.
-            # TRIG is the last word written → MCU cannot fire before BUF is ready.
-            packet = struct.pack('<I', idx) + chunk + struct.pack('<I', CTRL_CHUNK)
-            self._sidecar_write(packet)
-            self._sock.sendall(
-                f'load_image {self._WSL_CHUNK_PATH} 0x{FAST_IDX_ADDR:08X} bin\n'.encode()
-            )
-            self._read_prompt()
+        packet = struct.pack('<I', idx) + chunk + struct.pack('<I', CTRL_CHUNK)
+        self._sidecar_write(packet)
+        self._sock.sendall(
+            f'load_image {self._WSL_CHUNK_PATH} 0x{FAST_IDX_ADDR:08X} bin\n'.encode()
+        )
+        self._read_prompt()
 
     def _wait_trig_clear(self):
         """Poll FAST_TRIG until the MCU clears it (finished drawing the chunk).
@@ -444,9 +399,8 @@ class VapeDisplay:
         for idx, chunk in enumerate(chunks):
             if chunk == self._prev_chunks[idx]:
                 continue
-            prev = self._prev_chunks[idx]   # capture before overwriting
             self._prev_chunks[idx] = chunk
-            self._send_chunk(idx, chunk, prev)
+            self._send_chunk(idx, chunk)
             chunks_sent += 1
             self._wait_trig_clear()
 
