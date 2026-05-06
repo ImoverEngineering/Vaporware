@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """stream_frames.py — Stream frames to the N32G031 vape display via SWD.
 
-Requires: pip install pillow mss pywin32
+Requires: pip install pillow mss
 OpenOCD must be installed in WSL (used instead of pyocd — more reliable on
 this hardware). The ST-Link is attached to WSL automatically on startup.
 
@@ -21,24 +21,18 @@ Usage examples:
     python stream_frames.py --halt
 
 Protocol (see streamer.c for MCU side):
-    Double-buffer layout — two independent 64x8 logical ping-pong buffers,
-    MCU 2x-scales each to 128x16 display pixels.
+    Fast streaming layout — one write_memory per chunk:
 
-    CTRL   @ 0x20000010   0xDEAD0001 = halt, 0xDEAD0000 = reset
+    FAST_IDX  @ 0x20000100   chunk index 0–9
+    FAST_BUF  @ 0x20000104   4096 bytes of pixel data (128×16 px, BGR565 LE)
+    FAST_TRIG @ 0x20001104   0xCC written LAST — MCU blits chunk, clears to 0
 
-    IDX_A  @ 0x20000100   chunk index 0-9
-    BUF_A  @ 0x20000104   1024 bytes pixel data (64x8 px logical, BGR565 LE)
-    TRIG_A @ 0x20000504   0xCC written LAST — MCU blits A (scaled 2x), clears to 0
+    OpenOCD write_memory 0x20000100 32 {idx <1024 words> 0xCC}
+    FAST_TRIG is the final word — MCU cannot fire before BUF is fully written.
 
-    IDX_B  @ 0x20000508   chunk index 0-9
-    BUF_B  @ 0x2000050C   1024 bytes pixel data (64x8 px logical, BGR565 LE)
-    TRIG_B @ 0x2000090C   0xCC written LAST — MCU blits B (scaled 2x), clears to 0
-
-    PC pipelines all dirty chunk writes via write_memory inline (no file I/O,
-    no sidecar, no per-chunk round-trips). All commands fire before any prompt
-    is collected. MCU draw time at 4 MHz SPI = 8.2 ms per chunk; SWD write per
-    chunk = ~11 ms; A/B alternation means a buffer isn't reused for 22 ms —
-    always after MCU finishes drawing (8.2 ms). Safe without explicit polling.
+    Legacy CTRL @ 0x20000010:
+        0xDEAD0000 = reset display
+        0xDEAD0001 = sleep display + idle loop (for halt)
 """
 
 import argparse
@@ -49,12 +43,6 @@ import struct
 import subprocess
 import sys
 import time
-
-try:
-    import numpy as np
-    HAS_NUMPY = True
-except ImportError:
-    HAS_NUMPY = False
 
 # ── Dependencies check ────────────────────────────────────────────────────────
 try:
@@ -70,42 +58,26 @@ except ImportError:
     HAS_MSS = False
 
 # ── Protocol ──────────────────────────────────────────────────────────────────
-CTRL_ADDR  = 0x20000010   # legacy: reset / sleep
+FAST_IDX_ADDR  = 0x20000100
+FAST_BUF_ADDR  = 0x20000104   # IDX(4) + 4096 bytes of pixel data
+FAST_TRIG_ADDR = 0x20001104   # IDX(4) + BUF(4096) bytes past FAST_IDX_ADDR
+CTRL_ADDR      = 0x20000010   # legacy: reset / sleep
 
-# Half-resolution double-buffer: 64×80 logical pixels, 2× scaled by MCU to 128×160.
-# 4× fewer bytes per frame vs full-res → ~4× more fps for all-dirty frames.
-#
-# Double-buffer A  (1024 B pixel data)
-BUF_A_IDX_ADDR  = 0x20000100
-BUF_A_DATA_ADDR = 0x20000104   # IDX_A(4) + 1024 bytes pixel data
-BUF_A_TRIG_ADDR = 0x20000504   # IDX_A(4) + BUF_A(1024) past BUF_A_IDX_ADDR
-
-# Double-buffer B  (1024 B pixel data)
-BUF_B_IDX_ADDR  = 0x20000508
-BUF_B_DATA_ADDR = 0x2000050C   # IDX_B(4) + 1024 bytes pixel data
-BUF_B_TRIG_ADDR = 0x2000090C   # IDX_B(4) + BUF_B(1024) past BUF_B_IDX_ADDR
-
-# Combined packet sizes:
-#   Packet A/B: IDX(4) + BUF(1024) + TRIG(4) = 1032 B
-#   At 91 KB/s: ~11 ms per full chunk; 10 chunks all dirty → ~113 ms → ~9 fps
-#   MCU draw_chunk_2x at 24 MHz SPI: ~1.4 ms → always done before PC revisits
-BUF_CHUNK_BYTES = 1024    # pixel bytes per chunk (64 x 8 x 2)
-FULL_PACKET     = 1032    # IDX(4) + BUF(1024) + TRIG(4)
-
-# At 4 MHz SPI each 128×16 blit = 4096 bytes = 8.19 ms.
-# Worst-case MCU latency before starting a draw: up to 8 ms (if it is mid-draw
-# on the *other* buffer when we set TRIG).  Total safe window = 8 + 8.2 + 0.3 = 16.5 ms.
-# send_frame() uses this as the threshold for skipping the poll-for-clear check.
-MCU_DRAW_S = 0.0165      # 16.5 ms worst-case: 8 ms MCU latency + 8.2 ms SPI + margin
+# Chunk BUF is written as a raw binary file then loaded via OpenOCD load_image.
+# This avoids the telnet text-command limit (~230 words / 2559 chars) and is faster
+# than six separate write_memory hex-text commands.
+# The Windows path is used by Python; the /mnt/c/ path by OpenOCD in WSL.
+_STREAMER_DIR  = os.path.dirname(os.path.abspath(__file__))
+CHUNK_BIN_WIN  = os.path.join(_STREAMER_DIR, 'chunk_buf.bin')
+CHUNK_BIN_WSL  = '/mnt/c/' + CHUNK_BIN_WIN.replace('\\', '/').replace('C:/', '').replace('c:/', '')
 
 CTRL_IDLE  = 0x00000000
 CTRL_CHUNK = 0x000000CC
 CTRL_RESET = 0xDEAD0000
 CTRL_SLEEP = 0xDEAD0001
 
-CHUNK_ROWS  = 8     # logical rows per chunk
-CHUNK_W     = 64    # logical pixels per row (MCU 2× scales to 128)
-NUM_CHUNKS  = 10    # 10 × 8 logical rows = 80 → 160 display rows
+CHUNK_ROWS = 16
+NUM_CHUNKS = 10
 LCD_W, LCD_H = 128, 160
 
 # ── OpenOCD / WSL config ──────────────────────────────────────────────────────
@@ -123,41 +95,18 @@ OCD_TELNET_PORT = 4444
 
 # ── Color conversion ──────────────────────────────────────────────────────────
 def image_to_chunks(img):
-    """Convert any PIL Image → NUM_CHUNKS raw chunk byte-strings (BGR565 LE).
-
-    Image is downscaled to CHUNK_W × (NUM_CHUNKS*CHUNK_ROWS) logical pixels.
-    The MCU 2× scales each chunk back to full display resolution via
-    display_draw_chunk_2x(), so 64×80 logical → 128×160 on-screen.
-
-    Uses numpy for vectorised BGR565 conversion (~50× faster than a Python loop).
-    Falls back to a pure-Python loop if numpy is not available.
-    """
-    log_h = NUM_CHUNKS * CHUNK_ROWS   # 80 logical rows
-    # BILINEAR is 3-5× faster than LANCZOS and indistinguishable at 64×80
-    img = img.convert("RGB").resize((CHUNK_W, log_h), Image.BILINEAR)
-
-    if HAS_NUMPY:
-        arr = np.frombuffer(img.tobytes(), dtype=np.uint8).reshape(log_h, CHUNK_W, 3)
-        r = arr[:, :, 0].astype(np.uint16)
-        g = arr[:, :, 1].astype(np.uint16)
-        b = arr[:, :, 2].astype(np.uint16)
-        # BGR565 little-endian: bits [15:11]=B [10:5]=G [4:0]=R
-        bgr565 = ((b >> 3) << 11) | ((g >> 2) << 5) | (r >> 3)
-        raw = bgr565.astype('<u2').tobytes()   # already LE on x86
-        chunk_bytes = CHUNK_W * CHUNK_ROWS * 2
-        return [raw[ci * chunk_bytes:(ci + 1) * chunk_bytes]
-                for ci in range(NUM_CHUNKS)]
-
-    # Pure-Python fallback
+    """Convert any PIL Image → 10 raw chunk byte-strings (4096 B each, BGR565 LE)."""
+    img = img.convert("RGB").resize((LCD_W, LCD_H), Image.LANCZOS)
     data = img.tobytes()
+
     chunks = []
     for ci in range(NUM_CHUNKS):
         row0 = ci * CHUNK_ROWS
-        buf = bytearray(CHUNK_W * CHUNK_ROWS * 2)
+        buf = bytearray(LCD_W * CHUNK_ROWS * 2)
         off = 0
         for row in range(CHUNK_ROWS):
-            src = ((row0 + row) * CHUNK_W) * 3
-            for col in range(CHUNK_W):
+            src = ((row0 + row) * LCD_W) * 3
+            for col in range(LCD_W):
                 r = data[src];     src += 1
                 g = data[src];     src += 1
                 b = data[src];     src += 1
@@ -188,33 +137,18 @@ class VapeDisplay:
     # native filesystem.  Reading /tmp from WSL is instant (tmpfs); reading
     # /mnt/c/ (Windows filesystem) adds ~50 ms of cross-FS overhead per chunk.
     #
-    # For full packets: 2056 bytes [IDX(4)][BUF(2048)][TRIG(4)].
-    # For sparse writes: variable size, one range at a time.
-    # The file is overwritten for each range; prompts are collected between writes
-    # to ensure OpenOCD has read the file before we clobber it.
+    # The file is 4104 bytes: [IDX(4)] [BUF(4096)] [TRIG(4)]
+    # Written in one load_image to 0x20000100, so TRIG is the LAST word written —
+    # the MCU cannot fire until BUF is fully resident in SRAM.
     _WSL_CHUNK_PATH = '/tmp/vape_chunk.bin'
 
     def __init__(self, freq=4000000):
-        # Per-buffer previous-frame tracking for trimmed/sparse writes.
-        # _prev_A[i] = bytes last written to BUF_A for chunk index i (or None).
-        # _prev_B[i] = bytes last written to BUF_B for chunk index i (or None).
-        # We alternate A/B for consecutive dirty chunks each frame; knowing which
-        # buffer a chunk index last occupied lets us diff against the correct SRAM
-        # content so partial writes leave the correct pixels in the other region.
-        self._prev_A = [None] * NUM_CHUNKS   # bytes in SRAM buffer A for each chunk
-        self._prev_B = [None] * NUM_CHUNKS   # bytes in SRAM buffer B for each chunk
-        self._last_sent = [None] * NUM_CHUNKS # content last triggered → what display shows
-        self._buf_toggle = False   # False → next dirty chunk goes to A; True → B
-        # Timestamps of the last TRIG write for each buffer.  Used to enforce the
-        # MCU_DRAW_S guard in send_frame(): we must not overwrite BUF_A/B while
-        # the MCU is still SPI-blitting from it.  Initialised to 0 so the first
-        # write to each buffer always proceeds without sleeping.
-        self._last_trig_A_time = 0.0
-        self._last_trig_B_time = 0.0
+        self._prev_chunks = [None] * NUM_CHUNKS
         self._freq_khz = freq // 1000
         self._sock = None
         self._ocd_proc = None
         self._wsl_keepalive = None  # persistent WSL process; keeps WSL VM alive so usbipd doesn't detach
+        self._wsl_writer = None    # sidecar: receives chunk bytes, writes to WSL /tmp
         self._rxbuf = b''   # persistent receive buffer for telnet stream
         self._connect()
 
@@ -244,7 +178,38 @@ class VapeDisplay:
         )
         time.sleep(0.5)  # brief wait for the keepalive process to settle in WSL
 
-        # Attach ST-Link to WSL
+        # Launch WSL chunk-writer sidecar.  Python (Windows) can't write directly
+        # to WSL's native /tmp filesystem; going through /mnt/c/ adds ~50 ms of
+        # cross-filesystem overhead per chunk.  This sidecar reads 4096-byte chunks
+        # from its stdin and writes them to /tmp/vape_chunk.bin (tmpfs, instant),
+        # then prints "ok\n" so the caller knows the file is ready.
+        # Sidecar: reads a 4-byte LE length prefix, then that many bytes of
+        # chunk data, writes to /tmp/vape_chunk.bin (tmpfs), acks "ok\n".
+        # Variable-size protocol so partial (trimmed) writes work correctly.
+        _sidecar_py = (
+            'import sys,struct\n'
+            'p="/tmp/vape_chunk.bin"\n'
+            'while True:\n'
+            '  hdr=sys.stdin.buffer.read(4)\n'
+            '  if len(hdr)<4: break\n'
+            '  n=struct.unpack("<I",hdr)[0]\n'
+            '  buf=bytearray()\n'
+            '  while len(buf)<n:\n'
+            '    c=sys.stdin.buffer.read(n-len(buf))\n'
+            '    if not c: break\n'
+            '    buf+=c\n'
+            '  if not buf: break\n'
+            '  open(p,"wb").write(bytes(buf))\n'
+            '  sys.stdout.write("ok\\n"); sys.stdout.flush()\n'
+        )
+        self._wsl_writer = subprocess.Popen(
+            ['wsl', '-u', 'root', 'python3', '-c', _sidecar_py],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+
+        # Now attach ST-Link to WSL
         print("  Attaching ST-Link to WSL…")
         result = subprocess.run(
             ['usbipd', 'attach', '--wsl', '--busid', USBIPD_BUSID],
@@ -354,157 +319,110 @@ class VapeDisplay:
         self._sock.sendall((command + '\n').encode())
         return self._read_prompt()
 
-    def _wait_trig_clear(self, trig_addr, timeout_s=0.5):
-        """Poll TRIG via mrw until MCU clears it (it finished drawing from that buffer).
+    def _sidecar_write(self, data):
+        """Write variable-length binary data to the WSL sidecar (length-prefixed)."""
+        self._wsl_writer.stdin.write(struct.pack('<I', len(data)))
+        self._wsl_writer.stdin.write(data)
+        self._wsl_writer.stdin.flush()
+        self._wsl_writer.stdout.readline()   # block until sidecar acks
 
-        Fast path: returns on the first poll if TRIG is already 0 — cost is one
-        ~2 ms telnet round-trip.  Only spins when the timing guard says the MCU
-        might still be drawing (elapsed < MCU_DRAW_S).
+    def _send_chunk(self, idx, chunk, prev_chunk=None):
+        """Write one chunk to the MCU, sending only the changed byte range.
+
+        If prev_chunk is provided, trims unchanged leading/trailing words to
+        reduce the load_image payload.  Only writes the region [trim_start,
+        trim_end) within FAST_BUF rather than all 4096 bytes.
+
+        Break-even analysis: trimmed path adds ~4 ms overhead (two extra mww
+        round-trips for IDX and TRIG instead of the combined packet).  The
+        trimmed path is only taken when the partial payload is small enough
+        that the USB transfer savings outweigh that overhead (~3731 bytes).
+
+        SRAM layout (contiguous):
+          0x20000100  FAST_IDX  (4 bytes)
+          0x20000104  FAST_BUF  (4096 bytes)
+          0x20001104  FAST_TRIG (4 bytes)  ← written LAST; MCU fires only after BUF ready
         """
-        deadline = time.monotonic() + timeout_s
-        while time.monotonic() < deadline:
-            resp = self._cmd(f'mrw 0x{trig_addr:08X}')
-            m = re.search(r'0x([0-9a-fA-F]+)', resp)
-            if m and int(m.group(1), 16) == 0:
-                return
-            time.sleep(0.001)
+        WORD = 4  # alignment for SWD bulk writes
 
-    @staticmethod
-    def _compute_ranges(chunk, prev_chunk, gap_thr=180):
-        """Return list of (start, end) dirty byte ranges, merging gaps <= gap_thr bytes.
-
-        Scans word-by-word (4 bytes).  Contiguous or near-contiguous dirty words
-        are merged into a single range if the gap between them is <= gap_thr bytes.
-
-        Break-even for splitting vs merging one gap:
-            USB throughput ~91 KB/s; one extra load_image round-trip ~2 ms.
-            2 ms x 91 KB/s = 182 bytes — so merging gaps <= 180 bytes saves a
-            round-trip's worth of overhead.
-        """
-        WORD = 4
-        n = len(chunk)
-        ranges = []
-        cur_start = None
-        last_end  = 0
-        for i in range(0, n, WORD):
-            if chunk[i:i+WORD] != prev_chunk[i:i+WORD]:
-                if cur_start is None:
-                    cur_start = i
-                    last_end  = i + WORD
-                elif i - last_end <= gap_thr:
-                    last_end = i + WORD   # extend current range through the gap
-                else:
-                    ranges.append((cur_start, last_end))
-                    cur_start = i
-                    last_end  = i + WORD
-        if cur_start is not None:
-            ranges.append((cur_start, last_end))
-        return ranges
-
-    def _queue_chunk(self, idx, chunk, buf_idx_addr, buf_data_addr, buf_trig_addr,
-                     prev_chunk=None):
-        """Queue a chunk write via inline write_memory — no file I/O, no sidecar.
-
-        Sends all OpenOCD commands to the socket without collecting any prompts.
-        Caller must drain exactly the returned number of pending prompts afterward.
-
-        All dirty data is encoded as hex words and sent inline in the telnet command,
-        so there is no cross-process IPC and no WSL filesystem overhead.
-
-        Buffer safety: caller pipelines A and B alternately; each buffer is reused
-        only after 2 SWD write slots (~22 ms), which is always after the MCU
-        finishes drawing from it (~8.2 ms at 4 MHz SPI). No TRIG polling needed.
-
-        Returns the number of OpenOCD commands queued (= prompts to collect).
-        """
-        # ── Dirty-range detection ─────────────────────────────────────────────
+        # ── Compute changed range ─────────────────────────────────────────────
         if prev_chunk is not None and len(prev_chunk) == len(chunk):
-            ranges = self._compute_ranges(chunk, prev_chunk)
-            if not ranges:
-                return 0   # identical — nothing to send
+            n = len(chunk)
+            trim_start = n   # will hold first changed word start
+            trim_end   = 0   # will hold last  changed word end
+            for i in range(0, n, WORD):
+                if chunk[i:i+WORD] != prev_chunk[i:i+WORD]:
+                    if trim_start == n:
+                        trim_start = i
+                    trim_end = i + WORD
+            if trim_start == n:
+                return  # no change (shouldn't reach here in send_frame)
         else:
-            ranges = [(0, len(chunk))]
+            trim_start, trim_end = 0, len(chunk)
 
-        total_dirty = sum(e - s for s, e in ranges)
+        partial_len = trim_end - trim_start
 
-        # ── Full combined write_memory ─────────────────────────────────────────
-        # One call: [IDX(4)][BUF(1024)][TRIG(4)] = 258 words.
-        # TRIG is the last word, so MCU cannot fire until BUF is fully written.
-        if total_dirty >= FULL_PACKET - 364:
+        # ── Choose write path ─────────────────────────────────────────────────
+        # Break-even: trimmed path costs +4 ms (two extra mww round-trips).
+        # Measured USB throughput: ~91 KB/s.  4 ms = ~364 bytes saved.
+        # Use trimmed path only when partial_len < full_len − 364 bytes.
+        FULL_PACKET = 4104  # IDX(4) + BUF(4096) + TRIG(4)
+        USE_TRIM = (partial_len < FULL_PACKET - 364)
+
+        if USE_TRIM:
+            # Partial write: write only the changed region of FAST_BUF, then
+            # set IDX and TRIG via separate mww commands.
+            # FAST_BUF already holds the previous full chunk for this idx;
+            # writing only the delta leaves unchanged pixels intact. ✓
+            partial = chunk[trim_start:trim_end]
+            self._sidecar_write(partial)
+            buf_addr = FAST_BUF_ADDR + trim_start
+            cmds = [
+                f'mww 0x{FAST_IDX_ADDR:08X} 0x{idx:08X}\n',
+                f'load_image {self._WSL_CHUNK_PATH} 0x{buf_addr:08X} bin\n',
+                f'mww 0x{FAST_TRIG_ADDR:08X} 0x{CTRL_CHUNK:08X}\n',
+            ]
+            for c in cmds:
+                self._sock.sendall(c.encode())
+            for _ in cmds:
+                self._read_prompt()
+        else:
+            # Full combined write: [IDX(4)][BUF(4096)][TRIG(4)] in one load_image.
+            # TRIG is the last word written → MCU cannot fire before BUF is ready.
             packet = struct.pack('<I', idx) + chunk + struct.pack('<I', CTRL_CHUNK)
-            words = struct.unpack(f'<{len(packet)//4}I', packet)
-            hw = ' '.join(f'0x{w:08X}' for w in words)
+            self._sidecar_write(packet)
             self._sock.sendall(
-                f'write_memory 0x{buf_idx_addr:08X} 32 {{{hw}}}\n'.encode()
+                f'load_image {self._WSL_CHUNK_PATH} 0x{FAST_IDX_ADDR:08X} bin\n'.encode()
             )
-            return 1
+            self._read_prompt()
 
-        # ── Sparse write_memory (few dirty ranges) ────────────────────────────
-        # IDX first, then each dirty range, then TRIG last.
-        pending = 0
-        self._sock.sendall(f'mww 0x{buf_idx_addr:08X} 0x{idx:08X}\n'.encode())
-        pending += 1
+    def _wait_trig_clear(self):
+        """Poll FAST_TRIG until the MCU clears it (finished drawing the chunk).
 
-        for s, e in ranges:
-            buf = chunk[s:e]
-            if len(buf) % 4:
-                buf = buf + b'\xff' * (4 - len(buf) % 4)
-            words = struct.unpack(f'<{len(buf)//4}I', buf)
-            hw = ' '.join(f'0x{w:08X}' for w in words)
-            self._sock.sendall(
-                f'write_memory 0x{buf_data_addr + s:08X} 32 {{{hw}}}\n'.encode()
-            )
-            pending += 1
-
-        self._sock.sendall(
-            f'mww 0x{buf_trig_addr:08X} 0x{CTRL_CHUNK:08X}\n'.encode()
-        )
-        pending += 1
-        return pending
+        After TRIG=0xCC the MCU does a SPI blit (~8 ms at 4 MHz SPI).
+        We must not overwrite FAST_BUF until the MCU finishes reading it.
+        One mrw round-trip is usually enough — prompt collection already
+        takes ~10-15 ms, by which time the MCU has typically already cleared.
+        """
+        deadline = time.monotonic() + 0.080
+        while time.monotonic() < deadline:
+            resp = self._cmd(f'mrw 0x{FAST_TRIG_ADDR:08X}')
+            if '0xcc' not in resp.lower():
+                return
 
     def send_frame(self, chunks):
-        """Send all changed chunks, pipelining all writes before collecting prompts.
-
-        All dirty-chunk write_memory commands are fired in one burst before any
-        response is awaited. OpenOCD executes them sequentially over SWD while
-        Python is already collecting the returned prompts from the socket.
-
-        Per-buffer timing safety (no TRIG polling needed):
-          SWD write per chunk ≈ 11 ms; MCU draw per chunk ≈ 8.2 ms.
-          Buffer A is reused at chunk +2 (≥22 ms later); MCU finished at ≤19.2 ms.
-          Buffer B: same argument. Both buffers are always clear before reuse.
-
-        _last_sent[ci] — what is currently displayed for chunk ci.
-        _prev_A/B[ci]  — what is in each SRAM buffer for chunk ci (for sparse diff).
-        """
+        """Send all changed chunks. Returns (elapsed_seconds, chunks_sent)."""
         t0 = time.monotonic()
-        total_pending = 0
         chunks_sent = 0
 
-        for ci, chunk in enumerate(chunks):
-            if chunk == self._last_sent[ci]:
-                continue   # display already shows this content
-
-            if not self._buf_toggle:
-                n = self._queue_chunk(ci, chunk,
-                                      BUF_A_IDX_ADDR, BUF_A_DATA_ADDR, BUF_A_TRIG_ADDR,
-                                      self._prev_A[ci])
-                self._prev_A[ci] = chunk
-            else:
-                n = self._queue_chunk(ci, chunk,
-                                      BUF_B_IDX_ADDR, BUF_B_DATA_ADDR, BUF_B_TRIG_ADDR,
-                                      self._prev_B[ci])
-                self._prev_B[ci] = chunk
-
-            total_pending += n
-            self._last_sent[ci] = chunk
-            self._buf_toggle = not self._buf_toggle
+        for idx, chunk in enumerate(chunks):
+            if chunk == self._prev_chunks[idx]:
+                continue
+            prev = self._prev_chunks[idx]   # capture before overwriting
+            self._prev_chunks[idx] = chunk
+            self._send_chunk(idx, chunk, prev)
             chunks_sent += 1
-
-        # Collect all queued prompts in one pass — by now most SWD writes are
-        # already complete or in flight, so these return quickly.
-        for _ in range(total_pending):
-            self._read_prompt()
+            self._wait_trig_clear()
 
         return time.monotonic() - t0, chunks_sent
 
@@ -518,12 +436,7 @@ class VapeDisplay:
     def reset_display(self):
         """Force MCU to re-init the GC9107 display."""
         self._cmd(f'mww 0x{CTRL_ADDR:08X} 0x{CTRL_RESET:08X}')
-        self._prev_A = [None] * NUM_CHUNKS
-        self._prev_B = [None] * NUM_CHUNKS
-        self._last_sent = [None] * NUM_CHUNKS
-        self._buf_toggle = False
-        self._last_trig_A_time = 0.0
-        self._last_trig_B_time = 0.0
+        self._prev_chunks = [None] * NUM_CHUNKS
 
     def close(self):
         try:
@@ -540,6 +453,12 @@ class VapeDisplay:
                 self._ocd_proc.wait(timeout=3)
             except Exception:
                 self._ocd_proc.terminate()
+        if self._wsl_writer:
+            try:
+                self._wsl_writer.stdin.close()
+                self._wsl_writer.wait(timeout=2)
+            except Exception:
+                self._wsl_writer.terminate()
         if self._wsl_keepalive:
             try:
                 self._wsl_keepalive.terminate()
@@ -572,7 +491,7 @@ def test_frames():
 def screen_frames(bbox):
     x, y, w, h = bbox
     if HAS_MSS:
-        with mss.MSS() as sct:
+        with mss.mss() as sct:
             region = {"left": x, "top": y, "width": w, "height": h}
             while True:
                 shot = sct.grab(region)
@@ -585,21 +504,26 @@ def screen_frames(bbox):
 
 
 def window_frames(title):
-    """Capture a window by title using mss (fast screen-region capture).
-
-    Uses win32gui to find the window and get its bounds, then mss to capture
-    the screen region.  mss grabs directly from the display buffer (~5 ms) vs
-    PrintWindow's GDI blit (~1500 ms), giving ~300× faster capture.
-    Works with SDL2/OpenGL windows that PrintWindow cannot capture correctly.
-    """
     try:
-        import win32gui
+        import win32gui, win32ui
+        from ctypes import windll
+        import ctypes
     except ImportError:
         print("ERROR: pywin32 not installed. Run: pip install pywin32")
         sys.exit(1)
-    if not HAS_MSS:
-        print("ERROR: mss not installed. Run: pip install mss")
-        sys.exit(1)
+
+    # Make this process DPI-aware so GetClientRect returns physical pixel
+    # dimensions and PrintWindow renders into a correctly-sized bitmap.
+    # Without this, on high-DPI monitors GetClientRect returns logical coords
+    # but PrintWindow renders at physical resolution — only the upper-left
+    # portion of the game fills the bitmap and the rest is clipped.
+    try:
+        ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+    except Exception:
+        try:
+            ctypes.windll.user32.SetProcessDPIAware()   # fallback: system DPI aware
+        except Exception:
+            pass
 
     def find_window(partial_title):
         result = []
@@ -617,23 +541,35 @@ def window_frames(title):
         sys.exit(1)
     print(f"  Capturing window: '{win32gui.GetWindowText(hwnd)}'")
 
-    with mss.MSS() as sct:
-        while True:
-            try:
-                left, top, right, bot = win32gui.GetWindowRect(hwnd)
-                region = {"left": left, "top": top,
-                          "width": right - left, "height": bot - top}
-                shot = sct.grab(region)
-                img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
-                yield img
-            except Exception:
-                # SDL2 games recreate their window handle on mode switches.
-                new_hwnd = find_window(title)
-                if new_hwnd and new_hwnd != hwnd:
-                    hwnd = new_hwnd
-                    print(f"\n  Window handle refreshed: '{win32gui.GetWindowText(hwnd)}'")
-                else:
-                    time.sleep(0.05)
+    while True:
+        try:
+            # GetClientRect returns client-area dimensions in physical pixels
+            # (with DPI awareness set above).  This excludes the title bar and
+            # window borders, so we capture only the game content.
+            cl, ct, cr, cb_r = win32gui.GetClientRect(hwnd)
+            w, h = cr - cl, cb_r - ct
+            if w == 0 or h == 0:
+                time.sleep(0.05)
+                continue
+            hwnd_dc  = win32gui.GetWindowDC(hwnd)
+            mfc_dc   = win32ui.CreateDCFromHandle(hwnd_dc)
+            save_dc  = mfc_dc.CreateCompatibleDC()
+            bmp      = win32ui.CreateBitmap()
+            bmp.CreateCompatibleBitmap(mfc_dc, w, h)
+            save_dc.SelectObject(bmp)
+            # PW_CLIENTONLY (1) | PW_RENDERFULLCONTENT (2) = 3
+            windll.user32.PrintWindow(hwnd, save_dc.GetSafeHdc(), 3)
+            bmpinfo  = bmp.GetInfo()
+            bmpstr   = bmp.GetBitmapBits(True)
+            img = Image.frombuffer("RGB", (bmpinfo["bmWidth"], bmpinfo["bmHeight"]),
+                                   bmpstr, "raw", "BGRX", 0, 1)
+            win32gui.DeleteObject(bmp.GetHandle())
+            save_dc.DeleteDC(); mfc_dc.DeleteDC()
+            win32gui.ReleaseDC(hwnd, hwnd_dc)
+            yield img
+        except Exception as e:
+            print(f"\n  Window capture error: {e}")
+            time.sleep(0.1)
 
 
 def file_frames(path):
@@ -677,7 +613,7 @@ def main():
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument("--test",   action="store_true",
                       help="Animated rainbow test pattern")
-    mode.add_argument("--screen", nargs="*", metavar="X Y W H",
+    mode.add_argument("--screen", nargs="*", metavar=("X","Y","W","H"),
                       help="Capture screen region [x y w h] (default: full monitor)")
     mode.add_argument("--window", metavar="TITLE",
                       help="Capture window by title substring (Windows only)")
@@ -713,7 +649,7 @@ def main():
             bbox = tuple(int(v) for v in args.screen)
         else:
             if HAS_MSS:
-                with mss.MSS() as sct:
+                with mss.mss() as sct:
                     m = sct.monitors[1]
                     bbox = (m["left"], m["top"], m["width"], m["height"])
             else:

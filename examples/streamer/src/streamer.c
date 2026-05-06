@@ -4,26 +4,19 @@
  * baseline.  The only addition is the SWD streaming protocol loop in place of
  * the game loop.
  *
- * Clock: 8 MHz HSI throughout.  SPI1 at 4 MHz (BR_DIV2 of APB2=8MHz).
- *   SPI speed experiments: 24 MHz (PLL/BR_DIV2) and 12 MHz (PLL/BR_DIV4) both
- *   cause flashing white/black display — the PCB trace geometry limits reliable
- *   SPI to 4 MHz regardless of the GC9107 spec (which allows 32 MHz).
+ * Clock: 8 MHz HSI throughout.  No PLL boost.  SPI runs at 4 MHz.
+ *   This matches flappy exactly and guarantees display_init() works.
  *
- * Half-resolution double-buffer layout — 64×80 logical pixels, 2× scaled:
+ * SRAM layout (one write_memory per chunk):
  *
- *   CTRL       @ 0x20000010  0xDEAD0000 = reset display     (4 bytes)
- *   IDX_A      @ 0x20000100  chunk index for buffer A        (4 bytes)
- *   BUF_A      @ 0x20000104  64×8 logical px = 1024 B        (1024 bytes)
- *   TRIG_A     @ 0x20000504  0xCC = buffer A ready           (4 bytes) <- written LAST
- *   IDX_B      @ 0x20000508  chunk index for buffer B        (4 bytes)
- *   BUF_B      @ 0x2000050C  64×8 logical px = 1024 B        (1024 bytes)
- *   TRIG_B     @ 0x2000090C  0xCC = buffer B ready           (4 bytes) <- written LAST
+ *   CTRL      @ 0x20000010  0xDEAD0000 = reset display
+ *   FAST_IDX  @ 0x20000100  chunk index 0-9         (4 bytes)
+ *   FAST_BUF  @ 0x20000104  pixel data 128x16x2 B   (4096 bytes)
+ *   FAST_TRIG @ 0x20001104  0xCC = chunk ready       (4 bytes) <- written LAST
  *
- * MCU calls display_draw_chunk_2x() — scales 64×8 → 128×16 display pixels.
- * At 12 MHz SPI each 128×16 blit takes ~2.7 ms vs ~11 ms PC write of 1032 B.
- * MCU is always done long before PC revisits the same buffer — no handshake.
- *
- * Stack: 0x20002000 (top) down — ~7408 B available (plenty).
+ * The PC sends a single write_memory(FAST_IDX_ADDR, 32, {idx <1024 words> 0xCC}).
+ * FAST_TRIG is the last word written, so the MCU cannot act before the full
+ * chunk is resident in SRAM.
  */
 
 #include "n32g031.h"
@@ -31,27 +24,19 @@
 #include "system.h"
 #include "battery.h"
 
-/* Legacy control word */
-#define CTRL  ((volatile uint32_t *)0x20000010UL)
-
-/* Buffer A — 64×8 logical pixels = 1024 bytes */
-#define IDX_A  ((volatile uint32_t *)0x20000100UL)
-#define BUF_A  ((const uint16_t     *)0x20000104UL)
-#define TRIG_A ((volatile uint32_t *)0x20000504UL)
-
-/* Buffer B — 64×8 logical pixels = 1024 bytes */
-#define IDX_B  ((volatile uint32_t *)0x20000508UL)
-#define BUF_B  ((const uint16_t     *)0x2000050CUL)
-#define TRIG_B ((volatile uint32_t *)0x2000090CUL)
+/* Protocol SRAM addresses */
+#define CTRL      ((volatile uint32_t *)0x20000010UL)
+#define FAST_IDX  ((volatile uint32_t *)0x20000100UL)
+#define FAST_BUF  ((const uint16_t     *)0x20000104UL)
+#define FAST_TRIG ((volatile uint32_t *)0x20001104UL)
 
 #define CTRL_IDLE  0x00000000UL
 #define CTRL_CHUNK 0x000000CCUL
 #define CTRL_RESET 0xDEAD0000UL
 #define CTRL_SLEEP 0xDEAD0001UL
 
-#define CHUNK_ROWS  8u    /* logical rows per chunk */
-#define CHUNK_W    64u    /* logical pixels per row (display_draw_chunk_2x scales to 128) */
-#define NUM_CHUNKS 10u    /* 10 × 8 logical rows = 80 → 160 display rows after 2× scale */
+#define CHUNK_ROWS 16u
+#define NUM_CHUNKS 10u
 
 /* draw_waiting — shown at startup while waiting for the PC to start streaming.
  * Fills the entire screen bright magenta so it is unmistakable; overlays three
@@ -86,22 +71,21 @@ int main(void)
     }
 
     /* ── Core hardware init (identical to flappy.c) ─────────────────────── */
-    clock_init();              /* 8 MHz HSI, TIM3 PSC=7 → 1 ms ticks         */
+    clock_init();          /* 8 MHz HSI, TIM3 PSC=7 → 1 ms ticks             */
     delay_ms(50);
-    display_init();            /* 4 MHz SPI — hard limit of this board's traces*/
+    display_init();        /* 4 MHz SPI — same as flappy, guaranteed to work  */
     display_set_backlight(80);
     tim1_init();
     bat_init();            /* ADC init — included because flappy includes it  */
 
     /* ── Init protocol SRAM ─────────────────────────────────────────────── */
-    *CTRL   = CTRL_IDLE;
-    *TRIG_A = CTRL_IDLE;
-    *TRIG_B = CTRL_IDLE;
+    *CTRL      = CTRL_IDLE;
+    *FAST_TRIG = CTRL_IDLE;
 
     /* Show startup screen while waiting for the PC to connect */
     draw_waiting();
 
-    /* ── Streaming loop (double-buffer ping-pong) ────────────────────────── */
+    /* ── Streaming loop ──────────────────────────────────────────────────── */
     while (1) {
         IWDG_FEED();
 
@@ -114,33 +98,23 @@ int main(void)
 
         /* PC writes CTRL_RESET → re-init display (e.g. after power glitch) */
         if (*CTRL == CTRL_RESET) {
-            *CTRL   = CTRL_IDLE;
-            *TRIG_A = CTRL_IDLE;
-            *TRIG_B = CTRL_IDLE;
+            *CTRL      = CTRL_IDLE;
+            *FAST_TRIG = CTRL_IDLE;
             display_init();
             display_set_backlight(80);
             draw_waiting();
             continue;
         }
 
-        /* Buffer A: 64×8 logical chunk, 2× scaled to 128×16 display pixels. */
-        if (*TRIG_A == CTRL_CHUNK) {
-            uint32_t idx = *IDX_A;
+        /* Main path: PC has written IDX + BUF, then set TRIG via mww.
+         * Read IDX and BUF immediately — no slow operations before reading them. */
+        if (*FAST_TRIG == CTRL_CHUNK) {
+            uint32_t idx = *FAST_IDX;
             if (idx < NUM_CHUNKS) {
-                uint16_t log_row = (uint16_t)(idx * CHUNK_ROWS);
-                display_draw_chunk_2x(BUF_A, log_row, CHUNK_W, CHUNK_ROWS);
+                uint16_t row_start = (uint16_t)(idx * CHUNK_ROWS);
+                display_draw_chunk_cpu(FAST_BUF, row_start, CHUNK_ROWS);
             }
-            *TRIG_A = CTRL_IDLE;
-        }
-
-        /* Buffer B: identical, independent of A. */
-        if (*TRIG_B == CTRL_CHUNK) {
-            uint32_t idx = *IDX_B;
-            if (idx < NUM_CHUNKS) {
-                uint16_t log_row = (uint16_t)(idx * CHUNK_ROWS);
-                display_draw_chunk_2x(BUF_B, log_row, CHUNK_W, CHUNK_ROWS);
-            }
-            *TRIG_B = CTRL_IDLE;
+            *FAST_TRIG = CTRL_IDLE;
         }
     }
 }
