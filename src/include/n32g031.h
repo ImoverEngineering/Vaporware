@@ -72,9 +72,15 @@ typedef struct {
 #define RCC_CR_PLLON        (1UL << 24)
 #define RCC_CR_PLLRDY       (1UL << 25)
 
-/* RCC_CFGR bits */
-#define RCC_CFGR_SW_PLL     (0x2UL << 0)
-#define RCC_CFGR_SWS_PLL    (0x2UL << 2)
+/* RCC_CFGR bits
+ * SW=10 (bit1) selects PLL as SYSCLK; must be written BEFORE PLLON.
+ * SWS on N32G031 is NOT at bits[3:2] — the hardware never updates those bits.
+ * Instead, bit14 is set by hardware when PLL becomes SYSCLK and cleared when
+ * SYSCLK returns to HSI.  Confirmed by SRAM snapshot: CFGR = 0x20104002 with
+ * bit14=1 when PLLRDY fired with SW=10, and CFGR = 0x20100000 (bit14=0) after
+ * SW was reverted to HSI. */
+#define RCC_CFGR_SW_PLL     (0x2UL << 0)   /* SW=10: request PLL as SYSCLK */
+#define RCC_CFGR_SWS_PLL    (1UL << 14)    /* bit14: hardware confirms PLL is SYSCLK */
 #define RCC_CFGR_PLLSRC_HSI (0UL << 16)
 /* PLLMUL: HSI(8MHz) × 6 = 48MHz → bits[21:18]=4 → 0x00100000 */
 #define RCC_CFGR_PLLMULL_6  (4UL << 18)
@@ -225,7 +231,12 @@ typedef struct {
 #define SPI_CR1_SSI         (1UL << 8)   /* Internal slave select (must be 1 in master+SSM) */
 #define SPI_CR1_SSM         (1UL << 9)   /* Software slave management (NSS controlled by SSI) */
 #define SPI_CR1_DFF         (1UL << 11)  /* Data frame format: 0=8-bit, 1=16-bit */
-#define SPI_CR1_BIDIMODE    (1UL << 15)  /* Bidirectional mode (not used) */
+#define SPI_CR1_BIDIOE      (1UL << 14)  /* Bidirectional output enable: 1=TX-only (MOSI only, no RX) */
+#define SPI_CR1_BIDIMODE    (1UL << 15)  /* Bidirectional mode enable: 1=half-duplex 1-wire SPI */
+
+/* SPI_CR2 bits */
+#define SPI_CR2_RXDMAEN     (1UL << 0)   /* RX buffer DMA enable */
+#define SPI_CR2_TXDMAEN     (1UL << 1)   /* TX buffer DMA enable — set to arm DMA-driven SPI TX */
 
 /* SPI_SR bits */
 #define SPI_SR_RXNE         (1UL << 0)   /* RX buffer not empty */
@@ -273,6 +284,60 @@ typedef struct {
 #define FLASH_ACR_LATENCY_1WS  (1UL << 0)
 #define FLASH_ACR_PRFTBE       (1UL << 4)
 #define FLASH_ACR_INIT_48MHZ   (FLASH_ACR_PRFTBE | FLASH_ACR_LATENCY_1WS)
+
+/* ---- DMA1 (AHB; DMA1EN = AHBENR bit 0; base = 0x40020000) ----
+ *
+ * Fixed channel mapping (no CSELR — channels are hardwired to peripherals):
+ *   Channel 2: SPI1_RX
+ *   Channel 3: SPI1_TX  ← used by display_draw_chunk_dma()
+ *
+ * Channel n register block starts at DMA1_BASE + 0x08 + (n-1)*0x14.
+ * Channel 3 → 0x40020000 + 0x08 + 2*0x14 = 0x40020030.
+ *
+ * ISR/IFCR bit positions for channel 3 (bits[11:8]):
+ *   GIF3=8, TCIF3=9, HTIF3=10, TEIF3=11
+ *
+ * CCR (configuration) bit fields:
+ *   EN=0      channel enable
+ *   TCIE=1    transfer-complete interrupt enable (not used — we poll ISR)
+ *   DIR=4     transfer direction: 0=periph→mem, 1=mem→periph
+ *   CIRC=5    circular mode
+ *   PINC=6    peripheral address increment
+ *   MINC=7    memory address increment
+ *   PSIZE=9:8 peripheral data width: 00=8-bit, 01=16-bit, 10=32-bit
+ *   MSIZE=11:10 memory data width
+ *   PL=13:12  priority: 00=low … 11=very high
+ */
+#define DMA1_BASE   0x40020000UL
+
+#define RCC_AHBENR_DMA1EN   (1UL << 0)
+
+typedef struct {
+    volatile uint32_t ISR;   /* +0x00 Interrupt status (read-only) */
+    volatile uint32_t IFCR;  /* +0x04 Interrupt flag clear (write 1 to clear) */
+} DMA_TypeDef;
+
+typedef struct {
+    volatile uint32_t CCR;      /* +0x00 Channel configuration */
+    volatile uint32_t CNDTR;    /* +0x04 Number of data items to transfer */
+    volatile uint32_t CPAR;     /* +0x08 Peripheral base address */
+    volatile uint32_t CMAR;     /* +0x0C Memory base address */
+    volatile uint32_t RESERVED;
+} DMA_Channel_TypeDef;
+
+#define DMA1        ((DMA_TypeDef        *) DMA1_BASE)
+#define DMA1_CH3    ((DMA_Channel_TypeDef *)(DMA1_BASE + 0x30UL))
+
+/* DMA CCR bits */
+#define DMA_CCR_EN      (1UL << 0)    /* Channel enable */
+#define DMA_CCR_TCIE    (1UL << 1)    /* Transfer complete interrupt enable */
+#define DMA_CCR_DIR     (1UL << 4)    /* Direction: 1 = memory to peripheral */
+#define DMA_CCR_MINC    (1UL << 7)    /* Memory address increment */
+#define DMA_CCR_PL_HIGH (2UL << 12)   /* Priority level: high */
+
+/* DMA ISR / IFCR channel 3 bits */
+#define DMA_ISR_TCIF3   (1UL << 9)
+#define DMA_IFCR_CTCIF3 (1UL << 9)
 
 /* ---- ADC1 (AHB; ADCEN = AHBENR bit 12; base = 0x40020800) ----
  *

@@ -60,6 +60,12 @@ void delay_ms(uint32_t ms);
  * WARNING: wraps at 65535 ms. Use (uint16_t) subtraction for deltas. */
 uint32_t millis(void);
 
+/* Boost SYSCLK from 8 MHz HSI to 48 MHz via PLL (HSI × 6).
+ * Call after clock_init() and before display_init().
+ * Updates TIM3 prescaler so delay_ms() remains accurate.
+ * SPI1 reaches 24 MHz automatically (BR_DIV2 of APB2=48MHz). */
+void clock_boost_48mhz(void);
+
 /* Initialise TIM1 as a free-running 1 kHz wall clock.
  * Call once after clock_init() and before the first call to ms_now().
  * TIM1 is not used for interrupts, capture, or PWM in this firmware. */

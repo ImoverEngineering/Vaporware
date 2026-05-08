@@ -90,6 +90,33 @@ void display_set_window(uint16_t x0, uint16_t y0, uint16_t x1, uint16_t y1);
 void display_draw_image(const uint16_t *img, uint16_t x, uint16_t y,
                         uint16_t w, uint16_t h);
 
+/* Blit a 128×nrows chunk to (0, row_start) using CPU-polled SPI.
+ * Simpler than DMA — no channel-mapping dependency.  At 24 MHz SPI each
+ * 128×16 chunk takes ~1.4 ms; during this time SWD writes incur wait-states
+ * but still succeed (OpenOCD retries automatically).
+ * Asserts and deasserts CS. */
+void display_draw_chunk_cpu(const uint16_t *buf, uint16_t row_start, uint16_t nrows);
+
+/* Blit a 128×nrows chunk to (0, row_start) using DMA-driven SPI.
+ * buf   — pointer to 128*nrows uint16_t pixels in row-major order (BGR565)
+ * row_start — first display row to write (0-origin)
+ * nrows     — number of rows in this chunk (typically 16)
+ *
+ * The CPU idles during the DMA transfer so the AHB bus is free for SWD
+ * memory writes.  This eliminates the bus-contention problem that made PLL
+ * reduce SWD throughput with the old CPU-polling SPI path.
+ *
+ * Requires DMA1 clock enabled before first call (RCC->AHBENR |= RCC_AHBENR_DMA1EN).
+ * Asserts and deasserts CS. */
+void display_draw_chunk_dma(const uint16_t *buf, uint16_t row_start, uint16_t nrows);
+
+/* Blit a log_w × log_h logical chunk, scaling 2× in both axes.
+ * Physical output: (0, log_row*2) .. (127, log_row*2 + log_h*2 - 1).
+ * Used by the half-resolution SWD streamer (64×80 → 128×160 display).
+ * Asserts and deasserts CS. */
+void display_draw_chunk_2x(const uint16_t *src, uint16_t log_row,
+                            uint16_t log_w, uint16_t log_h);
+
 /* Draw a single pixel at (x,y).
  * Out-of-bounds: silently ignored (x>=128 or y>=160).
  * Asserts and deasserts CS per pixel — use display_fill_rect for areas. */
