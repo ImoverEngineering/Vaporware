@@ -10,7 +10,7 @@ microcontroller driving a 128×160 GC9107 LCD.
 
 | Item | Value |
 |---|---|
-| MCU | N32G031K8Q7-1 (Cortex-M0, 8 MHz HSI, no PLL) |
+| MCU | N32G031K8Q7-1 (Cortex-M0, 8 MHz HSI; PLL can reach 48 MHz — see `clock_boost_48mhz()`) |
 | Flash | 64 KB (top 4 KB reserved for NV storage) |
 | SRAM | 8 KB |
 | VDDA | 3.0 V (LDO-regulated, NOT 3.3 V — affects all ADC readings) |
@@ -70,6 +70,19 @@ TIM1 (wall clock). SysTick is not functional on this device variant.
 - `delay_ms(ms)` — blocking delay; feeds IWDG every 1ms
 - `ms_now()` — read TIM1 in ms (0–65535, wraps every ~65 s)
 - `millis()` — same as ms_now(), returns uint32_t
+- `clock_boost_48mhz()` — switch from 8 MHz HSI to 48 MHz PLL (HSI×6). Sets 2WS
+  flash latency before enabling PLL. Must be called **after** `display_init()` because
+  the display init sequence is tested at 8 MHz. After boosting, update SPI prescaler:
+  ```c
+  clock_boost_48mhz();
+  if (RCC->CFGR & RCC_CFGR_SWS_PLL) {
+      // 48 MHz / 4 = 12 MHz SPI (GC9107 max ≈ 16 MHz)
+      SPI1->CR1 = (SPI1->CR1 & ~(7UL << 3)) | SPI_CR1_BR_DIV4;
+  }
+  ```
+  Used by the streamer to cut per-chunk blit time from ~17 ms (4 MHz) to ~2.7 ms
+  (12 MHz), enabling ~7 fps streaming. Do **not** call `bat_init()` after boosting —
+  it writes RCC_CFGR2 and can disturb the PLL.
 
 **CRITICAL**: `ms_now()` wraps at 65535 ms. Always use `(uint16_t)` subtraction
 for elapsed-time comparisons:
@@ -90,6 +103,17 @@ Key behaviors:
 - `display_set_window()` leaves CS LOW — caller must manage CS
 - First `display_fill()` in `display_init()` flushes uninitialised GRAM
 - Backlight (PB4) is active-LOW plain GPIO — no PWM
+- **SPI OVR deadlock**: The N32G031 SPI OVR flag accumulates across separate transfers
+  and permanently stalls TXE after 2–3 full-screen operations. Fixed by toggling
+  `SPE=0` then `SPE=1` before each `display_fill()` or `display_draw_chunk_2x()` call
+  to clear all SPI status flags (OVR, RXNE, etc.)
+
+Additional display functions (not in the `app` framework path):
+- `display_draw_chunk_2x(buf, row0, w, h)` — blit a 64×40 logical-pixel buffer to
+  GRAM as a 128×80 physical block by doubling each pixel 2× horizontally and 2×
+  vertically. Used by the streamer for 2× upscaling without host-side resize.
+  `buf` is an array of `w×h` RGB565 words; `row0` is the first physical row (0 or 80).
+- `display_sleep_in()` — send SLPIN command and turn off backlight (power save).
 
 ### `battery` — ADC Battery Monitor
 
@@ -239,3 +263,6 @@ Flash via OpenOCD + hla_swd (see flash workflow memory note for trampoline detai
 | **BGR swap** | MADCTL=0x98 sets BGR=1. Use `COL_RGB(r,g,b)` macro — do not pass raw RGB565. |
 | **Flash writes are 32-bit** | The N32G031 does not support half-word (16-bit) flash programming. Always write 32-bit aligned words. |
 | **IWDG during sleep** | The IWDG is fed inside every busy-wait loop (flash, ADC, sleep polling). The watchdog never resets the device in normal operation. |
+| **SPI OVR accumulates** | The SPI OVR (overrun) flag is set whenever a received byte is not read, and it is not automatically cleared between transfers. After 2–3 full-screen fills the flag permanently stalls TXE. Always toggle `SPE=0→1` before starting a new SPI burst. |
+| **PLL disturbed by bat_init()** | `bat_init()` writes `RCC_CFGR2`, which touches the PLL divider field on some N32G031 revisions and causes the PLL to drop lock silently. Do not call `bat_init()` after `clock_boost_48mhz()`. |
+| **SWD still works at 48 MHz** | OpenOCD briefly loses comms during the PLL switch but auto-recovers. Use `adapter speed 240` or lower in your OpenOCD config for reliable access at 48 MHz. |

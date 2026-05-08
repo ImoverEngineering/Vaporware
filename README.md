@@ -46,7 +46,8 @@ Vaporware/
 │   ├── flappy/       Flappy Bird
 │   ├── slots/        Slot machine with NV high-score
 │   ├── diagnostic/   Hardware probe — checks every peripheral
-│   └── template/     Blank app skeleton — start here for a new project
+│   ├── template/     Blank app skeleton — start here for a new project
+│   └── streamer/     Live PC→display video streamer (screen capture, games)
 ├── tools/            Host-side scripts (flash, voltage check, diagnostics)
 ├── docs/             Hardware reference, reverse-engineering notes
 └── firmware/         Raw device flash backups (not compiled source)
@@ -112,6 +113,9 @@ The vape boots into the new firmware immediately after flashing.
 | **slots** | One-armed bandit with persistent high score | display, button, nv storage |
 | **diagnostic** | Hardware probe — dumps all sensor readings to display | all modules |
 | **template** | Skeleton app — copy this to start a new project | app framework |
+| **streamer** | Stream live video from PC to the display via SWD (~7 fps) | display, SWD protocol, Python host |
+
+The streamer example does not use the `app` framework — it implements its own `main()` and loops on an SWD-driven protocol. The companion host script (`stream_frames.py`) captures any window or screen region and pushes frames over ST-Link. See [`examples/streamer/README.md`](examples/streamer/README.md) for full setup and usage.
 
 ---
 
