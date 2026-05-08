@@ -2,7 +2,7 @@
 
 A minimal C firmware SDK for building games and apps on the **Raz DC25000** disposable vape — repurposed as a pocket game console.
 
-The device runs a Nations Tech **N32G031K8Q7-1** (ARM Cortex-M0) driving a 128×160 GC9107 IPS display, with a single button, battery ADC, and a coil MOSFET you can optionally fire. Total cost: ~$15. Total fun: outsized.
+The device runs a Nations Tech **N32G031K8Q7-1** (ARM Cortex-M0) driving a 128×160 GC9107 IPS display, with a single button, battery ADC, and a coil MOSFET you can optionally fire. All examples exclude the Coil MOSFET and pressure sensor.
 
 ---
 
@@ -214,12 +214,3 @@ The template build script already references `../../src` for the library — no 
 | `spi_sniff.py` | Passive SPI transaction capture via SWD memory reads |
 
 All scripts connect to an already-running OpenOCD telnet server on port 6666.
-
----
-
-## Reverse Engineering Notes
-
-The original Raz DC25000 firmware was reverse-engineered using Ghidra.
-Findings (pin assignments, function addresses, display init sequence, flash memory map)
-are documented in [`docs/FINDINGS.md`](docs/FINDINGS.md).
-Raw firmware dumps and analysis scripts live in [`docs/reverse_engineering/`](docs/reverse_engineering/).
