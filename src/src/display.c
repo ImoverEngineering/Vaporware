@@ -75,6 +75,16 @@ static void display_gpio_init(void) {
     LCD_DC_DATA();
     LCD_RST_HIGH();
 
+    /* PA4, PA5, PA6 — drive LOW.
+     * One of these is the display module power enable (active-LOW).
+     * Without this, the GC9107 receives SPI commands but shows nothing.
+     * Confirmed from slots/flappy firmware disassembly: GPIOA_ODR=0 at boot. */
+    RCC->APB2ENR |= RCC_APB2ENR_IOPAEN;  /* ensure GPIOA clock is on */
+    GPIOA->MODER &= ~((3UL << (4*2)) | (3UL << (5*2)) | (3UL << (6*2)));
+    GPIOA->MODER |=  ((1UL << (4*2)) | (1UL << (5*2)) | (1UL << (6*2))); /* outputs */
+    GPIOA->OTYPER &= ~((1UL << 4) | (1UL << 5) | (1UL << 6));
+    GPIOA->BSRR = (1UL << (4+16)) | (1UL << (5+16)) | (1UL << (6+16)); /* LOW */
+
     /* SPI1: full-duplex master, mode 0, 8-bit, software NSS.
      *
      * Full-duplex is used (no BIDIMODE) so RXNE asserts reliably after every
