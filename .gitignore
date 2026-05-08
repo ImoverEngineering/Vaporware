@@ -1,4 +1,5 @@
 # Build outputs
+build/
 examples/*/build/
 
 # Generated OpenOCD flash script (produced by gen_direct_flash.py)
