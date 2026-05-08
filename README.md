@@ -6,17 +6,19 @@ The device runs a Nations Tech **N32G031K8Q7-1** (ARM Cortex-M0) driving a 128×
 
 ---
 
-## Disclaimer
+## ⚠️ Disclaimer
 
-> **This project is for educational and research purposes only.**
+> **This software is provided for educational and research purposes only.**
 >
 > By using this project you acknowledge that:
 >
 > - **You assume all risk.** Modifying consumer electronics — especially lithium battery-powered devices — carries real hazards including fire, explosion, electric shock, and permanent hardware damage. Proceed only if you understand what you are doing.
 > - **The coil is dangerous.** The heating coil draws significant current from the LiPo cell. Custom firmware that fires the coil incorrectly (wrong duty cycle, no thermal cutoff, wrong timing) can cause the battery to overheat, vent, or catch fire. The examples in this repo do **not** fire the coil. If you choose to, you do so entirely at your own risk.
 > - **Vaping carries health risks.** This project does not encourage or endorse vaping. The hardware is used purely as a convenient, cheap embedded platform.
-> - **No warranty is provided.** The authors are not responsible for any damage to property, injury to persons, or any other consequence arising from the use of this software or the techniques described here.
+> - **Flashing may brick your device.** Incorrect firmware can permanently damage the hardware.
+> - **Exposure to chemicals.** Opening or modifying a vaping device may expose you to harmful substances.
 > - **Respect local laws.** Possession and modification of vaping devices may be regulated or prohibited in your jurisdiction.
+> - **No warranty. No liability.** THE AUTHOR(S) ARE NOT LIABLE FOR ANY DAMAGES, INJURIES, OR LEGAL CONSEQUENCES ARISING FROM THE USE OR MISUSE OF THIS SOFTWARE.
 
 ---
 
