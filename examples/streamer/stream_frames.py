@@ -730,23 +730,18 @@ def screen_frames(bbox):
 
 def window_frames(title):
     try:
-        import win32gui, win32ui
-        from ctypes import windll
+        import win32gui
         import ctypes
     except ImportError:
         print("ERROR: pywin32 not installed. Run: pip install pywin32")
         sys.exit(1)
 
-    # Make this process DPI-aware so GetClientRect returns physical pixel
-    # dimensions and PrintWindow renders into a correctly-sized bitmap.
-    # Without this, on high-DPI monitors GetClientRect returns logical coords
-    # but PrintWindow renders at physical resolution — only the upper-left
-    # portion of the game fills the bitmap and the rest is clipped.
+    # Make this process DPI-aware so screen coordinates are physical pixels.
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
     except Exception:
         try:
-            ctypes.windll.user32.SetProcessDPIAware()   # fallback: system DPI aware
+            ctypes.windll.user32.SetProcessDPIAware()
         except Exception:
             pass
 
@@ -766,32 +761,46 @@ def window_frames(title):
         sys.exit(1)
     print(f"  Capturing window: '{win32gui.GetWindowText(hwnd)}'")
 
+    # Use screen capture (mss/ImageGrab) instead of PrintWindow.
+    # PrintWindow cannot capture GPU-composited content (Chrome hardware
+    # acceleration, video playback, WebGL) — it returns a frozen blank frame.
+    # Screen capture reads the composited desktop output and works correctly
+    # with all hardware-accelerated windows.
     while True:
         try:
-            # GetClientRect returns client-area dimensions in physical pixels
-            # (with DPI awareness set above).  This excludes the title bar and
-            # window borders, so we capture only the game content.
-            cl, ct, cr, cb_r = win32gui.GetClientRect(hwnd)
-            w, h = cr - cl, cb_r - ct
-            if w == 0 or h == 0:
+            # GetWindowRect returns screen coordinates of the whole window.
+            # We capture the full window rect (including title bar) since
+            # screen_grab clips to actual screen content anyway.
+            left, top, right, bottom = win32gui.GetWindowRect(hwnd)
+            w, h = right - left, bottom - top
+            if w <= 0 or h <= 0:
                 time.sleep(0.05)
                 continue
-            hwnd_dc  = win32gui.GetWindowDC(hwnd)
-            mfc_dc   = win32ui.CreateDCFromHandle(hwnd_dc)
-            save_dc  = mfc_dc.CreateCompatibleDC()
-            bmp      = win32ui.CreateBitmap()
-            bmp.CreateCompatibleBitmap(mfc_dc, w, h)
-            save_dc.SelectObject(bmp)
-            # PW_CLIENTONLY (1) | PW_RENDERFULLCONTENT (2) = 3
-            windll.user32.PrintWindow(hwnd, save_dc.GetSafeHdc(), 3)
-            bmpinfo  = bmp.GetInfo()
-            bmpstr   = bmp.GetBitmapBits(True)
-            img = Image.frombuffer("RGB", (bmpinfo["bmWidth"], bmpinfo["bmHeight"]),
-                                   bmpstr, "raw", "BGRX", 0, 1)
-            win32gui.DeleteObject(bmp.GetHandle())
-            save_dc.DeleteDC(); mfc_dc.DeleteDC()
-            win32gui.ReleaseDC(hwnd, hwnd_dc)
-            yield img
+            if HAS_MSS:
+                import mss as _mss
+                with _mss.mss() as sct:
+                    region = {"left": left, "top": top, "width": w, "height": h}
+                    while True:
+                        # Re-check window is still there
+                        if not win32gui.IsWindowVisible(hwnd):
+                            break
+                        shot = sct.grab(region)
+                        yield Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+                        # Update rect each frame in case window moved/resized
+                        l2, t2, r2, b2 = win32gui.GetWindowRect(hwnd)
+                        if (l2, t2, r2, b2) != (left, top, right, bottom):
+                            left, top, right, bottom = l2, t2, r2, b2
+                            w, h = r2 - l2, b2 - t2
+                            region = {"left": left, "top": top, "width": w, "height": h}
+            else:
+                while True:
+                    if not win32gui.IsWindowVisible(hwnd):
+                        break
+                    img = ImageGrab.grab(bbox=(left, top, right, bottom))
+                    yield img
+                    l2, t2, r2, b2 = win32gui.GetWindowRect(hwnd)
+                    if (l2, t2, r2, b2) != (left, top, right, bottom):
+                        left, top, right, bottom = l2, t2, r2, b2
         except Exception as e:
             print(f"\n  Window capture error: {e}")
             time.sleep(0.1)
