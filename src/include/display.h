@@ -42,8 +42,20 @@
 
 /* ---- API ---- */
 
+/* Configure all display-related GPIO pins and SPI1.
+ * Called automatically by display_init() and display_recover() at boot.
+ * Also called by device_sleep() (app.c) during the wake sequence to restore
+ * GPIO and SPI after the sleep tristate period.
+ *
+ * Side effects: configures PB3/PB5 as SPI1 AF0, PA15/PB4/PB6/PB7 as outputs,
+ * PA4/PA5/PA6 as output-LOW (display VCC enable), and SPI1 CR1 (SPE=1).
+ * Sets BL (PB4) LOW (backlight ON) — caller must call display_set_backlight(0)
+ * afterward if the backlight should remain off during a redraw. */
+void display_gpio_init(void);
+
 /* Initialise GPIO, SPI1, and the GC9107 panel.
  * Requires clock_init() to have been called first (uses delay_ms internally).
+ * Uses only the hardware RST sequence — safe at any battery voltage.
  * Side effects:
  *   - Configures PB3/PB5 as SPI1 AF0, PA15/PB6/PB7 as GPIO outputs.
  *   - Drives PB4 (backlight) LOW (on) at the end of init.
@@ -51,6 +63,13 @@
  * Call display_set_backlight(1) after this if backlight was disabled by the
  * framework (app.c enables it explicitly after display_init returns). */
 void display_init(void);
+
+/* Hard power-cycle recovery for a stuck GC9107.
+ * Cuts VCC (PA4/5/6 HIGH) for 150 ms then re-runs the full init sequence.
+ * Only call when the display is confirmed non-responsive AND battery is
+ * healthy — the inrush current on VCC restore can trigger a brown-out reset
+ * at low battery, causing a boot loop and a permanently black screen. */
+void display_recover(void);
 
 /* Control the PB4 backlight.
  * on=0: HIGH = backlight off (active-LOW circuit: HIGH cuts LED driver)

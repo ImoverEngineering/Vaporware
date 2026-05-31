@@ -16,16 +16,21 @@
  *   the callback from repeating on subsequent frames while the button stays down.
  *   It resets when the button is released.
  *
- * Auto-sleep GPIO state:
- *   On sleep, device_sleep() sets EVERY GPIO pin to MODER=11 (analog/high-Z).
- *   Analog mode disconnects the output driver and pull-up/down — the pin truly
- *   floats — regardless of what OTYPER, OSPEEDR, or PUPDR contain.
- *   This ensures no current flows through the backlight LED driver or SPI lines.
- *   Four pins are then restored before the sleep wait loop:
- *     BTN_PORT/BTN_PIN — input so the button can wake the device
- *     PA13/PA14 (SWDIO/SWCLK) — AF mode so debugger stays reachable
- *     LCD_RST_PORT/LCD_RST_PIN — output HIGH (prevents GC9107 hardware reset)
- *     LCD_CS_PORT/LCD_CS_PIN  — output HIGH (blocks SPI noise into sleeping LCD)
+ * Sleep protocol (implemented in device_sleep()):
+ *   Cuts display VCC via the PA6 P-FET gate (PA4/5/6 driven HIGH = FET off).
+ *   This is the only reliable sleep mechanism on this hardware: the LED backlight
+ *   driver is powered from the display VCC rail, not a separate GPIO signal, so
+ *   GC9107 software sleep (0x10) and GPIO toggling (PB4) cannot extinguish it.
+ *   SPI is disabled before the VCC cut to prevent back-feed through the GC9107's
+ *   I/O protection diodes while VCC is absent.
+ *   1. SPI disable + PA4/5/6 HIGH → VCC off → backlight off, screen dark.
+ *   2. Poll button until press then release (IWDG fed throughout).
+ *   3. display_init(): drives PA4/5/6 LOW (VCC on), re-configures SPI and
+ *      display GPIOs, runs the RST sequence, sends the full GC9107 init table.
+ *   4. display_set_backlight(1): backlight on.
+ *   5. app_wake(): app-specific redraw (GRAM is undefined after a VCC cut).
+ *      Default app_wake() is a no-op; apps that implement it redraw before the
+ *      next frame fires so there is no visible garbage-GRAM flash.
  */
 #include "app.h"
 #include "config.h"
@@ -56,51 +61,30 @@ void app_set_hold_reset(uint16_t hold_ms, void (*cb)(void)) {
 /* ── Weak default for app_wake ────────────────────────────────────── */
 __attribute__((weak)) void app_wake(void) {}
 
-/* ── Device sleep (hardware-agnostic) ────────────────────────────── */
+/* ── Device sleep ─────────────────────────────────────────────────── */
 static void device_sleep(void) {
-    /* Fill panel black before killing backlight — prevents white-streak
-     * artefacts from floating SPI lines or display RAM noise.          */
-    display_fill(0x0000);
+    /* ── Step 1: Disable SPI and cut display VCC.
+     *   PA6 is the gate of the display VCC P-FET (source = battery, drain = VCC
+     *   rail).  Driving PA4/5/6 HIGH puts Vgs near 0 V, turning the FET off and
+     *   cutting power to both the GC9107 and the LED backlight driver.
+     *   SPI is disabled first: with VCC gone the GC9107's I/O pins are held up
+     *   by the MCU's driven SPI outputs, which back-feeds the chip through its
+     *   protection diodes.  Clearing SPE tristate the SPI pads before the cut. */
+    SPI1->CR1 &= ~SPI_CR1_SPE;
+    GPIOA->BSRR = (1UL << 4) | (1UL << 5) | (1UL << 6); /* PA4/5/6 HIGH = VCC OFF */
 
-    /* Save full GPIO config then put EVERY pin into analog/high-Z.
-     * This floats the backlight driver enable input off regardless of
-     * which physical pin is wired to it (hardware-agnostic).          */
-    uint32_t saved_a = GPIOA->MODER;
-    uint32_t saved_b = GPIOB->MODER;
-    GPIOA->MODER = 0xFFFFFFFFUL;
-    GPIOB->MODER = 0xFFFFFFFFUL;
-
-    /* Restore only the pins needed during sleep: */
-
-    /* Button — input with pull-up still active in PUPDR */
-    BTN_PORT->MODER &= ~(3UL << (BTN_PIN * 2));
-
-    /* SWD (PA13=SWDIO, PA14=SWCLK) — AF mode; Cortex-M0 fixed pins.
-     * Keep live so a debugger can reconnect without a full power cycle. */
-    GPIOA->MODER &= ~((3UL << (SWD_SWDIO_PIN * 2)) | (3UL << (SWD_SWCLK_PIN * 2)));
-    GPIOA->MODER |=   (2UL << (SWD_SWDIO_PIN * 2)) | (2UL << (SWD_SWCLK_PIN * 2));
-
-    /* Display RST — output HIGH (holds GC9107 out of reset so its GRAM
-     * registers survive sleep without a full re-init on wake).         */
-    LCD_RST_PORT->MODER &= ~(3UL << (LCD_RST_PIN * 2));
-    LCD_RST_PORT->MODER |=  (1UL  << (LCD_RST_PIN * 2));
-    LCD_RST_PORT->BSRR   =  (1UL  << LCD_RST_PIN);
-
-    /* Display CS — output HIGH (deasserted; blocks SPI bus noise).    */
-    LCD_CS_PORT->MODER &= ~(3UL << (LCD_CS_PIN * 2));
-    LCD_CS_PORT->MODER |=  (1UL  << (LCD_CS_PIN * 2));
-    LCD_CS_PORT->BSRR   =  (1UL  << LCD_CS_PIN);
-
-    /* Wait for button press then release (active-low).
-     * IWDG is fed continuously — device never bricks in sleep.        */
+    /* ── Step 2: Wait for button press then release ───────────────────── */
     while ( (BTN_PORT->IDR & (1u << BTN_PIN))) { IWDG_FEED(); } /* await LOW  */
     while (!(BTN_PORT->IDR & (1u << BTN_PIN))) { IWDG_FEED(); } /* await HIGH */
 
-    /* Restore full GPIO config */
-    GPIOA->MODER = saved_a;
-    GPIOB->MODER = saved_b;
-
-    /* Notify app to redraw */
+    /* ── Step 3: Restore VCC and reinitialize display.
+     *   display_init() drives PA4/5/6 LOW (VCC ON), reconfigures all display
+     *   GPIOs and SPI, then runs the RST + full GC9107 init sequence.
+     *   GC9107 GRAM is undefined after a VCC cut; app_wake() redraws the current
+     *   app state before the next frame fires to avoid a garbage-GRAM flash.   */
+    IWDG_FEED();
+    display_init();
+    display_set_backlight(1);
     app_wake();
 }
 
@@ -113,13 +97,21 @@ int main(void) {
 
     /* Core hardware init */
     clock_init();
-    delay_ms(50);
+    /* OG factory firmware waits ~1-2 s of peripheral init before touching the
+     * display.  200 ms here lets the LDO and GC9107 power rails fully stabilise
+     * after a fresh MCU reset before we start the RST sequence. */
+    IWDG_FEED(); delay_ms(200); IWDG_FEED();
+
+    /* Use RST-only init (display_init) — no VCC power cycle.
+     * display_recover() (VCC cut via PA4/5/6) leaves this panel white on some
+     * board variants; display_init() with just the RST sequence works correctly. */
+    bat_init();
     display_init();
     display_set_backlight(1);
     tim1_init();
     vape_init();
     button_init();
-    bat_init();     /* ADC init; does not alter PB0 GPIO mode */
+
 
     /* App-specific setup */
     app_init();

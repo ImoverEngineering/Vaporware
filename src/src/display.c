@@ -39,7 +39,7 @@ static void lcd_write_data(uint8_t data) {
     spi_write_byte(data);
 }
 
-static void display_gpio_init(void) {
+void display_gpio_init(void) {
     RCC->APB2ENR |= RCC_APB2ENR_IOPAEN | RCC_APB2ENR_IOPBEN | RCC_APB2ENR_SPI1EN;
 
     /* Backlight enable — active-LOW output, LOW = on at startup */
@@ -75,15 +75,23 @@ static void display_gpio_init(void) {
     LCD_DC_DATA();
     LCD_RST_HIGH();
 
-    /* PA4, PA5, PA6 — drive LOW.
-     * One of these is the display module power enable (active-LOW).
-     * Without this, the GC9107 receives SPI commands but shows nothing.
-     * Confirmed from slots/flappy firmware disassembly: GPIOA_ODR=0 at boot. */
+    /* PA4, PA5, PA6 — drive LOW as outputs.
+     * On the Raz DC25000 and GV2024 boards, PA6 (= ADC ch6 battery sense) is
+     * ALSO the gate of the display VCC P-FET.  Driving it LOW enables VCC;
+     * leaving it floating (~2.8 V from battery divider) puts Vgs ≈ -0.2 V,
+     * which is not enough to turn on the FET and the display panel has no power.
+     * bat_read_raw() saves GPIOA->MODER, briefly switches PA6 to analog for the
+     * ADC conversion (~21-84 µs), then restores PA6 to output-LOW.  The 239.5-
+     * cycle sample time is >>100× the RC time constant of the divider, so the
+     * ADC reading is accurate even though PA6 was at 0 V immediately before.
+     * PA4/PA5 are driven LOW as a defensive measure for board variants where
+     * they also gate display VCC; on boards where they are unconnected it is
+     * harmless.                                                               */
     RCC->APB2ENR |= RCC_APB2ENR_IOPAEN;  /* ensure GPIOA clock is on */
     GPIOA->MODER &= ~((3UL << (4*2)) | (3UL << (5*2)) | (3UL << (6*2)));
-    GPIOA->MODER |=  ((1UL << (4*2)) | (1UL << (5*2)) | (1UL << (6*2))); /* outputs */
+    GPIOA->MODER |=  ((1UL << (4*2)) | (1UL << (5*2)) | (1UL << (6*2)));
     GPIOA->OTYPER &= ~((1UL << 4) | (1UL << 5) | (1UL << 6));
-    GPIOA->BSRR = (1UL << (4+16)) | (1UL << (5+16)) | (1UL << (6+16)); /* LOW */
+    GPIOA->BSRR = (1UL << (4+16)) | (1UL << (5+16)) | (1UL << (6+16)); /* PA4/5/6 LOW */
 
     /* SPI1: full-duplex master, mode 0, 8-bit, software NSS.
      *
@@ -110,12 +118,111 @@ static void display_gpio_init(void) {
     SPI1->CR2 = 0;
 }
 
-void display_init(void) {
-    display_gpio_init();
+/* display_recover() — hard power-cycle the GC9107, then re-run display_init().
+ *
+ * Used when the GC9107 is stuck in an unknown state (e.g. after flashing new
+ * firmware over a running image, or after a crash mid-SPI-sequence).  RST alone
+ * is sometimes not enough; cutting VCC via PA4/5/6 guarantees a clean slate.
+ *
+ * DO NOT call this at low battery.  The 150 ms VCC cut + inrush on restore
+ * can sag the rail below the MCU brown-out threshold, causing a reset loop and
+ * a permanently black screen.  Use display_init() for normal boot; only call
+ * display_recover() when the display is confirmed stuck and battery is healthy.
+ */
+void display_recover(void) {
+    display_gpio_init();   /* ensure GPIOs configured; PA4/5/6 = output-LOW (VCC ON) */
 
+    GPIOA->BSRR = (1UL << 4) | (1UL << 5) | (1UL << 6); /* PA4/5/6 HIGH = VCC OFF */
+    LCD_RST_LOW();
+    IWDG_FEED(); delay_ms(150); IWDG_FEED();
+    GPIOA->BSRR = (1UL << (4+16)) | (1UL << (5+16)) | (1UL << (6+16)); /* VCC ON */
+    delay_ms(20);
+
+    /* Fall through into the standard RST + GC9107 init sequence below */
     LCD_RST_HIGH(); delay_ms(10);
     LCD_RST_LOW();  IWDG_FEED(); delay_ms(100); IWDG_FEED();
     LCD_RST_HIGH(); IWDG_FEED(); delay_ms(120); IWDG_FEED();
+
+    LCD_CS_LOW();
+    lcd_write_cmd(0x11);
+    IWDG_FEED(); delay_ms(120); IWDG_FEED();
+    lcd_write_cmd(0xFF); lcd_write_data(0xA5);
+    lcd_write_cmd(0x3E); lcd_write_data(0x08);
+    lcd_write_cmd(0x3A); lcd_write_data(0x65);
+    lcd_write_cmd(0x82); lcd_write_data(0x00);
+    lcd_write_cmd(0x98); lcd_write_data(0x00);
+    lcd_write_cmd(0x63); lcd_write_data(0x0F);
+    lcd_write_cmd(0x64); lcd_write_data(0x0F);
+    lcd_write_cmd(0xB4); lcd_write_data(0x34);
+    lcd_write_cmd(0xB5); lcd_write_data(0x30);
+    lcd_write_cmd(0x83); lcd_write_data(0x13);
+    lcd_write_cmd(0x86); lcd_write_data(0x04);
+    lcd_write_cmd(0x87); lcd_write_data(0x19);
+    lcd_write_cmd(0x88); lcd_write_data(0x2F);
+    lcd_write_cmd(0x89); lcd_write_data(0x36);
+    lcd_write_cmd(0x93); lcd_write_data(0x63);
+    lcd_write_cmd(0x96); lcd_write_data(0x81);
+    lcd_write_cmd(0xC3); lcd_write_data(0x10);
+    lcd_write_cmd(0xE6); lcd_write_data(0x00);
+    lcd_write_cmd(0x99); lcd_write_data(0x01);
+    lcd_write_cmd(0x44); lcd_write_data(0x00);
+    lcd_write_cmd(0x70); lcd_write_data(0x07);
+    lcd_write_cmd(0x71); lcd_write_data(0x19);
+    lcd_write_cmd(0x72); lcd_write_data(0x1A);
+    lcd_write_cmd(0x73); lcd_write_data(0x13);
+    lcd_write_cmd(0x74); lcd_write_data(0x19);
+    lcd_write_cmd(0x75); lcd_write_data(0x1D);
+    lcd_write_cmd(0x76); lcd_write_data(0x47);
+    lcd_write_cmd(0x77); lcd_write_data(0x0A);
+    lcd_write_cmd(0x78); lcd_write_data(0x07);
+    lcd_write_cmd(0x79); lcd_write_data(0x47);
+    lcd_write_cmd(0x7A); lcd_write_data(0x05);
+    lcd_write_cmd(0x7B); lcd_write_data(0x09);
+    lcd_write_cmd(0x7C); lcd_write_data(0x0D);
+    lcd_write_cmd(0x7D); lcd_write_data(0x0C);
+    lcd_write_cmd(0x7E); lcd_write_data(0x0C);
+    lcd_write_cmd(0x7F); lcd_write_data(0x08);
+    lcd_write_cmd(0xA0); lcd_write_data(0x0B);
+    lcd_write_cmd(0xA1); lcd_write_data(0x36);
+    lcd_write_cmd(0xA2); lcd_write_data(0x09);
+    lcd_write_cmd(0xA3); lcd_write_data(0x0D);
+    lcd_write_cmd(0xA4); lcd_write_data(0x08);
+    lcd_write_cmd(0xA5); lcd_write_data(0x23);
+    lcd_write_cmd(0xA6); lcd_write_data(0x3B);
+    lcd_write_cmd(0xA7); lcd_write_data(0x04);
+    lcd_write_cmd(0xA8); lcd_write_data(0x07);
+    lcd_write_cmd(0xA9); lcd_write_data(0x38);
+    lcd_write_cmd(0xAA); lcd_write_data(0x0A);
+    lcd_write_cmd(0xAB); lcd_write_data(0x12);
+    lcd_write_cmd(0xAC); lcd_write_data(0x0C);
+    lcd_write_cmd(0xAD); lcd_write_data(0x07);
+    lcd_write_cmd(0xAE); lcd_write_data(0x2F);
+    lcd_write_cmd(0xAF); lcd_write_data(0x07);
+    lcd_write_cmd(0xFF); lcd_write_data(0x00);
+    lcd_write_cmd(0x36); lcd_write_data(0x98);
+    lcd_write_cmd(0x29);
+    delay_ms(10);
+    LCD_CS_HIGH();
+
+    /* PA4/5/6 remain output-LOW (VCC ON) — set by display_gpio_init() above.
+     * bat_read_raw() temporarily switches PA6 to analog for each ADC conversion
+     * (saving and restoring GPIOA->MODER), so readings are accurate.        */
+
+    display_fill(0x0000);
+}
+
+void display_init(void) {
+    display_gpio_init();
+
+    /* RST sequence matched exactly to OG factory firmware (fw_dump.bin @ 0x8002A54):
+     *   RST HIGH → 10ms → RST LOW → 10ms → RST HIGH → 10ms → CS LOW → 0x11
+     * The factory firmware uses 10ms pulses throughout and sends Sleep Out (0x11)
+     * as the very first SPI command after RST deasserts.  Longer delays (we had
+     * 100ms/120ms) made no difference — the timing above is proven reliable.
+     * Factory firmware never touches PA4/5/6 and has no VCC power cycle. */
+    LCD_RST_HIGH(); delay_ms(10);
+    LCD_RST_LOW();  IWDG_FEED(); delay_ms(10);
+    LCD_RST_HIGH(); delay_ms(10);
 
     /* CS stays LOW for the entire init sequence.
      * The GC9107 state machine requires an uninterrupted SPI session during init
@@ -364,14 +471,27 @@ void display_set_backlight(uint8_t on) {
 }
 
 void display_sleep_in(void) {
-    display_set_backlight(0);
+    /* Backlight is powered by the GC9107's internal charge pump — it turns
+     * off automatically when Sleep In (0x10) stops the oscillator/DC-DC.
+     * Do NOT call display_set_backlight(0) here: driving PB4 HIGH before
+     * the SPI commands land disrupts the GC9107 and prevents Sleep In from
+     * being processed, leaving the screen white and backlight on. */
+
+    /* SPE toggle clears any OVR/TXE deadlock that accumulated during frame
+     * drawing — without it, lcd_write_cmd() can hang in spi_write_byte()
+     * waiting for TXE that never asserts, causing an IWDG reset mid-sleep. */
+    SPI1->CR1 &= ~SPI_CR1_SPE;
+    SPI1->CR1 |=  SPI_CR1_SPE;
     LCD_CS_LOW(); lcd_write_cmd(0x28); LCD_CS_HIGH(); /* Display Off */
     delay_ms(10);
-    LCD_CS_LOW(); lcd_write_cmd(0x10); LCD_CS_HIGH(); /* Sleep In */
+    LCD_CS_LOW(); lcd_write_cmd(0x10); LCD_CS_HIGH(); /* Sleep In → charge pump off → backlight off */
     delay_ms(5);
 }
 
 void display_sleep_out(void) {
+    /* SPE toggle clears OVR state before the post-sleep SPI commands. */
+    SPI1->CR1 &= ~SPI_CR1_SPE;
+    SPI1->CR1 |=  SPI_CR1_SPE;
     LCD_CS_LOW(); lcd_write_cmd(0x11); LCD_CS_HIGH(); /* Sleep Out */
     IWDG_FEED(); delay_ms(120); IWDG_FEED();
     LCD_CS_LOW(); lcd_write_cmd(0x29); LCD_CS_HIGH(); /* Display On */
