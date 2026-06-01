@@ -48,9 +48,9 @@
  * GPIO and SPI after the sleep tristate period.
  *
  * Side effects: configures PB3/PB5 as SPI1 AF0, PA15/PB4/PB6/PB7 as outputs,
- * PA4/PA5/PA6 as output-LOW (display VCC enable), and SPI1 CR1 (SPE=1).
- * Sets BL (PB4) LOW (backlight ON) — caller must call display_set_backlight(0)
- * afterward if the backlight should remain off during a redraw. */
+ * PA4 as output-LOW (display VCC P-FET enable), and SPI1 CR1 (SPE=1).
+ * PA5 and PA6 are left alone (coil gate / ADC sense respectively).
+ * Sets BL (PB4) LOW (backlight ON) — call display_set_backlight(0) after if needed. */
 void display_gpio_init(void);
 
 /* Initialise GPIO, SPI1, and the GC9107 panel.
@@ -64,11 +64,10 @@ void display_gpio_init(void);
  * framework (app.c enables it explicitly after display_init returns). */
 void display_init(void);
 
-/* Hard power-cycle recovery for a stuck GC9107.
- * Cuts VCC (PA4/5/6 HIGH) for 150 ms then re-runs the full init sequence.
- * Only call when the display is confirmed non-responsive AND battery is
- * healthy — the inrush current on VCC restore can trigger a brown-out reset
- * at low battery, causing a boot loop and a permanently black screen. */
+/* Extended-RST recovery for a stuck GC9107.
+ * Drives RST LOW for 100ms then re-runs the full init sequence.
+ * No VCC cut — PA4/5/6 are never driven HIGH (coil hazard on some variants).
+ * Safe to call at any battery level. */
 void display_recover(void);
 
 /* Control the PB4 backlight.

@@ -29,6 +29,28 @@ static void spi_write_byte(uint8_t byte) {
     while (SPI1->SR & SPI_SR_BSY);
 }
 
+/* spi_write_byte_fast — TXE-only write for bulk pixel bursts.
+ *
+ * On N32G031, polling BSY after every byte in a large burst deadlocks:
+ * the RX FIFO overflows (OVR) during TXE-only bursts and BSY gets stuck HIGH
+ * after several bytes, spinning forever.  For bulk pixel data we instead poll
+ * only TXE (safe with the SPE toggle done at the start of each fill) and rely
+ * on a 300-cycle fixed drain at the END of each bulk operation to let the last
+ * byte clock out before CS is raised.  This mirrors the approach in
+ * flash_video.c write_frame() which proved stable at 3 MHz SPI.
+ * Single-byte command/data writes (spi_write_byte) keep the BSY poll — those
+ * are sent one at a time with idle time in between, so OVR never accumulates.
+ */
+static inline void spi_write_byte_fast(uint8_t b) {
+    while (!(SPI1->SR & SPI_SR_TXE));
+    *(volatile uint8_t *)&SPI1->DR = b;
+}
+
+/* Drain the SPI shift register after a TXE-only burst.
+ * BSY polling deadlocks on N32G031 post-burst; 300 cycles @ 48 MHz = 6.25 µs
+ * ≥ 2 × byte time at 3 MHz SPI — safe at any PCLK ≤ 48 MHz. */
+#define SPI_DRAIN()  do { for (volatile uint32_t _d = 300u; _d--; ); } while (0)
+
 static void lcd_write_cmd(uint8_t cmd) {
     LCD_DC_CMD();
     spi_write_byte(cmd);
@@ -75,23 +97,19 @@ void display_gpio_init(void) {
     LCD_DC_DATA();
     LCD_RST_HIGH();
 
-    /* PA4, PA5, PA6 — drive LOW as outputs.
-     * On the Raz DC25000 and GV2024 boards, PA6 (= ADC ch6 battery sense) is
-     * ALSO the gate of the display VCC P-FET.  Driving it LOW enables VCC;
-     * leaving it floating (~2.8 V from battery divider) puts Vgs ≈ -0.2 V,
-     * which is not enough to turn on the FET and the display panel has no power.
-     * bat_read_raw() saves GPIOA->MODER, briefly switches PA6 to analog for the
-     * ADC conversion (~21-84 µs), then restores PA6 to output-LOW.  The 239.5-
-     * cycle sample time is >>100× the RC time constant of the divider, so the
-     * ADC reading is accurate even though PA6 was at 0 V immediately before.
-     * PA4/PA5 are driven LOW as a defensive measure for board variants where
-     * they also gate display VCC; on boards where they are unconnected it is
-     * harmless.                                                               */
-    RCC->APB2ENR |= RCC_APB2ENR_IOPAEN;  /* ensure GPIOA clock is on */
-    GPIOA->MODER &= ~((3UL << (4*2)) | (3UL << (5*2)) | (3UL << (6*2)));
-    GPIOA->MODER |=  ((1UL << (4*2)) | (1UL << (5*2)) | (1UL << (6*2)));
+    /* PA4, PA5, PA6 — drive LOW as outputs (display VCC enable).
+     * One or more of these pins gates the display VCC P-FET; driving all LOW
+     * guarantees VCC is on regardless of which specific pin is wired to the gate.
+     * Leaving them floating (input state) may leave the FET off → black screen.
+     *
+     * SAFETY: these pins must ONLY ever be driven LOW from display code.
+     * device_sleep() must NOT drive PA4/5/6 HIGH — PA5 is the coil gate on
+     * at least one board variant and driving it HIGH fires the heating element. */
+    RCC->APB2ENR |= RCC_APB2ENR_IOPAEN;
+    GPIOA->MODER  &= ~((3UL << (4*2)) | (3UL << (5*2)) | (3UL << (6*2)));
+    GPIOA->MODER  |=  ((1UL << (4*2)) | (1UL << (5*2)) | (1UL << (6*2)));
     GPIOA->OTYPER &= ~((1UL << 4) | (1UL << 5) | (1UL << 6));
-    GPIOA->BSRR = (1UL << (4+16)) | (1UL << (5+16)) | (1UL << (6+16)); /* PA4/5/6 LOW */
+    GPIOA->BSRR    =  (1UL << (4+16)) | (1UL << (5+16)) | (1UL << (6+16)); /* LOW = VCC ON */
 
     /* SPI1: full-duplex master, mode 0, 8-bit, software NSS.
      *
@@ -118,28 +136,20 @@ void display_gpio_init(void) {
     SPI1->CR2 = 0;
 }
 
-/* display_recover() — hard power-cycle the GC9107, then re-run display_init().
+/* display_recover() — extended RST pulse to un-stick the GC9107.
  *
  * Used when the GC9107 is stuck in an unknown state (e.g. after flashing new
- * firmware over a running image, or after a crash mid-SPI-sequence).  RST alone
- * is sometimes not enough; cutting VCC via PA4/5/6 guarantees a clean slate.
+ * firmware over a running image, or after a crash mid-SPI-sequence).
  *
- * DO NOT call this at low battery.  The 150 ms VCC cut + inrush on restore
- * can sag the rail below the MCU brown-out threshold, causing a reset loop and
- * a permanently black screen.  Use display_init() for normal boot; only call
- * display_recover() when the display is confirmed stuck and battery is healthy.
+ * VCC cut via PA4/5/6 has been removed: PA5 is the coil gate on at least one
+ * hardware variant, making it unsafe to drive.  The factory firmware never
+ * touches PA4/5/6.  An extended RST pulse (100 ms low) is sufficient to reset
+ * the GC9107 from any stuck state.
  */
 void display_recover(void) {
-    display_gpio_init();   /* ensure GPIOs configured; PA4/5/6 = output-LOW (VCC ON) */
+    display_gpio_init();   /* ensure GPIOs and SPI configured */
 
-    GPIOA->BSRR = (1UL << 4) | (1UL << 5) | (1UL << 6); /* PA4/5/6 HIGH = VCC OFF */
-    LCD_RST_LOW();
-    IWDG_FEED(); delay_ms(150); IWDG_FEED();
-    GPIOA->BSRR = (1UL << (4+16)) | (1UL << (5+16)) | (1UL << (6+16)); /* VCC ON */
-    delay_ms(20);
-
-    /* Fall through into the standard RST + GC9107 init sequence below */
-    LCD_RST_HIGH(); delay_ms(10);
+    /* Extended RST pulse — 100 ms is long enough to clear any GC9107 stuck state */
     LCD_RST_LOW();  IWDG_FEED(); delay_ms(100); IWDG_FEED();
     LCD_RST_HIGH(); IWDG_FEED(); delay_ms(120); IWDG_FEED();
 
@@ -203,10 +213,6 @@ void display_recover(void) {
     lcd_write_cmd(0x29);
     delay_ms(10);
     LCD_CS_HIGH();
-
-    /* PA4/5/6 remain output-LOW (VCC ON) — set by display_gpio_init() above.
-     * bat_read_raw() temporarily switches PA6 to analog for each ADC conversion
-     * (saving and restoring GPIOA->MODER), so readings are accurate.        */
 
     display_fill(0x0000);
 }
@@ -380,10 +386,11 @@ void display_fill(uint16_t color) {
     for (uint16_t row = 0; row < LCD_HEIGHT; row++) {
         IWDG_FEED();
         for (uint16_t col = 0; col < LCD_WIDTH; col++) {
-            spi_write_byte(hi);
-            spi_write_byte(lo);
+            spi_write_byte_fast(hi);
+            spi_write_byte_fast(lo);
         }
     }
+    SPI_DRAIN();
     *(volatile uint32_t *)0x2000009CUL = 0xEE440000UL;
     LCD_CS_HIGH();
 }
@@ -398,10 +405,11 @@ void display_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t 
     for (uint16_t row = 0; row < h; row++) {
         IWDG_FEED();
         for (uint16_t col = 0; col < w; col++) {
-            spi_write_byte(hi);
-            spi_write_byte(lo);
+            spi_write_byte_fast(hi);
+            spi_write_byte_fast(lo);
         }
     }
+    SPI_DRAIN();
     LCD_CS_HIGH();
 }
 
@@ -417,10 +425,11 @@ void display_draw_image(const uint16_t *img, uint16_t x, uint16_t y,
         const uint16_t *rowp = img + (uint32_t)row * w;
         for (uint16_t col = 0; col < w; col++) {
             uint16_t px = rowp[col];
-            spi_write_byte((uint8_t)(px >> 8));
-            spi_write_byte((uint8_t)(px & 0xFF));
+            spi_write_byte_fast((uint8_t)(px >> 8));
+            spi_write_byte_fast((uint8_t)(px & 0xFF));
         }
     }
+    SPI_DRAIN();
     LCD_CS_HIGH();
 }
 

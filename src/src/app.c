@@ -17,20 +17,15 @@
  *   It resets when the button is released.
  *
  * Sleep protocol (implemented in device_sleep()):
- *   Cuts display VCC via the PA6 P-FET gate (PA4/5/6 driven HIGH = FET off).
- *   This is the only reliable sleep mechanism on this hardware: the LED backlight
- *   driver is powered from the display VCC rail, not a separate GPIO signal, so
- *   GC9107 software sleep (0x10) and GPIO toggling (PB4) cannot extinguish it.
- *   SPI is disabled before the VCC cut to prevent back-feed through the GC9107's
- *   I/O protection diodes while VCC is absent.
- *   1. SPI disable + PA4/5/6 HIGH → VCC off → backlight off, screen dark.
+ *   Display VCC is switched by a P-channel MOSFET whose gate is PA4 and/or PA6.
+ *   Gate HIGH → FET off → VCC cut → display + backlight lose power.
+ *   PA5 is the coil gate on this hardware and must NEVER be driven HIGH.
+ *   1. SPI disable + PA4/PA6 HIGH → VCC off → backlight off, screen dark.
  *   2. Poll button until press then release (IWDG fed throughout).
  *   3. display_init(): drives PA4/5/6 LOW (VCC on), re-configures SPI and
- *      display GPIOs, runs the RST sequence, sends the full GC9107 init table.
+ *      display GPIOs, runs RST sequence, sends the full GC9107 init table.
  *   4. display_set_backlight(1): backlight on.
- *   5. app_wake(): app-specific redraw (GRAM is undefined after a VCC cut).
- *      Default app_wake() is a no-op; apps that implement it redraw before the
- *      next frame fires so there is no visible garbage-GRAM flash.
+ *   5. app_wake(): app-specific redraw (default no-op).
  */
 #include "app.h"
 #include "config.h"
@@ -63,25 +58,25 @@ __attribute__((weak)) void app_wake(void) {}
 
 /* ── Device sleep ─────────────────────────────────────────────────── */
 static void device_sleep(void) {
-    /* ── Step 1: Disable SPI and cut display VCC.
-     *   PA6 is the gate of the display VCC P-FET (source = battery, drain = VCC
-     *   rail).  Driving PA4/5/6 HIGH puts Vgs near 0 V, turning the FET off and
-     *   cutting power to both the GC9107 and the LED backlight driver.
-     *   SPI is disabled first: with VCC gone the GC9107's I/O pins are held up
-     *   by the MCU's driven SPI outputs, which back-feeds the chip through its
-     *   protection diodes.  Clearing SPE tristate the SPI pads before the cut. */
+    /* ── Step 1: Cut display VCC and disable SPI.
+     *   PA4 and PA6 are the gates of the display VCC P-FET (P-channel MOSFET:
+     *   gate HIGH → FET off → VCC rail cut → display + backlight lose power).
+     *   PA5 is deliberately excluded — it is the coil gate on this hardware
+     *   and driving it HIGH fires the heating element.
+     *   SPI is disabled first to tristate the SPI pads before VCC is removed,
+     *   preventing back-feed through the GC9107's I/O protection diodes.     */
     SPI1->CR1 &= ~SPI_CR1_SPE;
-    GPIOA->BSRR = (1UL << 4) | (1UL << 5) | (1UL << 6); /* PA4/5/6 HIGH = VCC OFF */
+    GPIOA->BSRR = (1UL << 4) | (1UL << 6);   /* PA4, PA6 HIGH = VCC OFF; PA5 untouched */
 
     /* ── Step 2: Wait for button press then release ───────────────────── */
     while ( (BTN_PORT->IDR & (1u << BTN_PIN))) { IWDG_FEED(); } /* await LOW  */
     while (!(BTN_PORT->IDR & (1u << BTN_PIN))) { IWDG_FEED(); } /* await HIGH */
 
     /* ── Step 3: Restore VCC and reinitialize display.
-     *   display_init() drives PA4/5/6 LOW (VCC ON), reconfigures all display
-     *   GPIOs and SPI, then runs the RST + full GC9107 init sequence.
-     *   GC9107 GRAM is undefined after a VCC cut; app_wake() redraws the current
-     *   app state before the next frame fires to avoid a garbage-GRAM flash.   */
+     *   display_init() calls display_gpio_init() which drives PA4/5/6 LOW
+     *   (VCC on), reconfigures SPI and display GPIOs, runs the RST sequence,
+     *   and sends the full GC9107 init table.  GRAM is undefined after a VCC
+     *   cut; app_wake() redraws before the next frame to avoid garbage flash. */
     IWDG_FEED();
     display_init();
     display_set_backlight(1);

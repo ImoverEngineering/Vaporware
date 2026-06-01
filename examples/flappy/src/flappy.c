@@ -737,6 +737,13 @@ static void on_hard_reset(void)
  * =================================================================== */
 void app_init(void)
 {
+    /* Hard-reset the GC9107 before first use.
+     * display_init() (called by the framework before app_init) runs the normal
+     * 10ms RST sequence.  display_recover() adds a longer 100ms RST pulse and
+     * full re-init — clears any stuck GC9107 state after firmware hot-flashing
+     * or SWD reconnect events.  No VCC cut is performed (PA4/5/6 not driven). */
+    display_recover();
+
     app_set_sleep_timeout(30000);          /* sleep after 30 s idle  */
     app_set_hold_reset(10000, on_hard_reset); /* hold 10 s → reset    */
 
