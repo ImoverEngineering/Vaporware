@@ -44,13 +44,22 @@
 
 /* Configure all display-related GPIO pins and SPI1.
  * Called automatically by display_init() and display_recover() at boot.
- * Also called by device_sleep() (app.c) during the wake sequence to restore
- * GPIO and SPI after the sleep tristate period.
+ * Also called indirectly by device_sleep() (app.c) via display_init() during
+ * the wake sequence to restore GPIO and SPI after the Stop-mode sleep period.
  *
- * Side effects: configures PB3/PB5 as SPI1 AF0, PA15/PB4/PB6/PB7 as outputs,
- * PA4 as output-LOW (display VCC P-FET enable), and SPI1 CR1 (SPE=1).
- * PA5 and PA6 are left alone (coil gate / ADC sense respectively).
- * Sets BL (PB4) LOW (backlight ON) — call display_set_backlight(0) after if needed. */
+ * Side effects:
+ *   - PB3/PB5: SPI1 AF0 (SCK/MOSI)
+ *   - PA15/PB6/PB7: GPIO outputs (CS/RST/DC)
+ *   - PA4/PA5/PA6: GPIO output-LOW (display VCC P-FET enable; all three must
+ *     be LOW — one or more of these gates the VCC P-channel MOSFET and it is
+ *     not guaranteed which pin is wired to the gate on any given board variant)
+ *   - SPI1 CR1: SPE=1 (SPI enabled)
+ *   - PB4 (backlight): output-LOW (backlight ON; call display_set_backlight(0)
+ *     immediately after if you want the backlight off on entry)
+ *
+ * SAFETY: PA5 is the coil gate on at least one board variant.  This function
+ * only ever drives PA4/5/6 LOW — it must NEVER drive them HIGH.
+ * device_sleep() drives PA4 and PA6 HIGH (VCC cut) while leaving PA5 LOW. */
 void display_gpio_init(void);
 
 /* Initialise GPIO, SPI1, and the GC9107 panel.
@@ -139,6 +148,20 @@ void display_draw_chunk_2x(const uint16_t *src, uint16_t log_row,
  * Out-of-bounds: silently ignored (x>=128 or y>=160).
  * Asserts and deasserts CS per pixel — use display_fill_rect for areas. */
 void display_draw_pixel(uint16_t x, uint16_t y, uint16_t color);
+
+/* Blit a w×h sprite at (x,y), skipping pixels equal to transparent_color.
+ * Opaque runs in each row are sent as individual display_draw_image calls.
+ * Partially out-of-bounds sprites are clipped — only visible columns are sent.
+ * color format: RGB565 with BGR swap (same as display_fill_rect / display_draw_image).
+ *
+ * Transparent color convention: use a colour that never appears in the sprite
+ * (COL_SKY 0xCDE9, COL_BLACK 0x0000, or any sentinel value).  Pixels matching
+ * transparent_color are skipped; pixels not matching are blitted.
+ *
+ * Example — blit a 17×12 bird sprite with sky-blue transparency:
+ *   display_draw_sprite(spr_bird, bird_x, bird_y, 17, 12, 0xCDE9U); */
+void display_draw_sprite(const uint16_t *pixels, uint16_t x, uint16_t y,
+                          uint16_t w, uint16_t h, uint16_t transparent_color);
 
 /* Sleep In sequence: backlight off → Display Off (0x28) → Sleep In (0x10).
  * After this call, SPI activity to the panel should stop.

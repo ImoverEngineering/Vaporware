@@ -32,9 +32,12 @@
  *   This is independent of the vaporware nv.h system (predates it).
  *
  * DISPLAY SLEEP:
- *   After DIM_MS (5s) idle: backlight dims to value 15 (gc9107_set_backlight(15)).
- *   After SLEEP_MS (30s) idle: full LCD sleep via gc9107_sleep_in(), all GPIO high-Z.
- *   SWD pins (PA13/PA14) remain in AF mode during sleep for debugger access.
+ *   After SLEEP_MS (30s) idle with no button activity, the framework's device_sleep()
+ *   fires: SPI is disabled, PA4+PA6 go HIGH (display VCC cut, screen dark, ~10-20 µA),
+ *   and the MCU enters Stop mode until a button press (EXTI7 PA7 falling edge).
+ *   On wake the 48 MHz PLL is restored, display_init() re-runs (VCC on, GRAM cleared),
+ *   and app_wake() redraws the current game state.
+ *   Backlight is plain GPIO (no PWM dimming). SWD stays accessible in Stop mode.
  *
  * Build: compile with -DFLAPPY_BIRD; exclude main.c / tamagotchi.c / slots.c
  */
@@ -199,9 +202,8 @@ static const uint8_t g_bldg[128] = {
 #define MAX_FALL_FP  40
 #define PHYS_MS      33u
 
-/* Inactivity timeouts (milliseconds, each ≤ 65535) */
-#define DIM_MS        5000u   /* dim backlight after this many ms idle */
-#define SLEEP_MS     30000u   /* screen off (LCD sleep) after this many ms idle */
+/* Inactivity timeout: framework enters Stop mode sleep after this many ms idle */
+#define SLEEP_MS     30000u
 
 /* ===================================================================
  * RNG
@@ -394,7 +396,8 @@ static int pipe_scroll(Pipe *p)
 }
 
 /* ===================================================================
- * Bird — transparent blit (skips COL_SKY pixels row-by-row)
+ * Bird — transparent blit via display_draw_sprite() (vaporware SDK)
+ * COL_SKY (0xCDE9) is the transparent sentinel in all three bird frames.
  * =================================================================== */
 static void bird_erase(int y)
 {
@@ -409,20 +412,7 @@ static void bird_render(int y, int32_t vel_fp)
     if (y + BIRD_H > PLAY_H) y = PLAY_H - BIRD_H;
     const uint16_t *spr = (vel_fp < -8) ? spr_bird_up :
                           (vel_fp > 12) ? spr_bird_dn : spr_bird_mid;
-
-    for (int r = 0; r < BIRD_H; r++) {
-        const uint16_t *row = spr + r * BIRD_W;
-        int c = 0;
-        while (c < BIRD_W) {
-            while (c < BIRD_W && row[c] == COL_SKY) c++;
-            if (c >= BIRD_W) break;
-            int start = c;
-            while (c < BIRD_W && row[c] != COL_SKY) c++;
-            gc9107_draw_image(row + start,
-                              (uint16_t)(BIRD_X + start), (uint16_t)(y + r),
-                              (uint16_t)(c - start), 1);
-        }
-    }
+    display_draw_sprite(spr, BIRD_X, (uint16_t)y, BIRD_W, BIRD_H, COL_SKY);
 }
 
 /* ===================================================================

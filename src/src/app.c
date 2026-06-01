@@ -21,11 +21,13 @@
  *   Gate HIGH → FET off → VCC cut → display + backlight lose power.
  *   PA5 is the coil gate on this hardware and must NEVER be driven HIGH.
  *   1. SPI disable + PA4/PA6 HIGH → VCC off → backlight off, screen dark.
- *   2. Poll button until press then release (IWDG fed throughout).
- *   3. display_init(): drives PA4/5/6 LOW (VCC on), re-configures SPI and
+ *   2. system_enter_stop(): MCU enters Stop mode (~10-20 µA), wakes on
+ *      EXTI7 falling edge (PA7 button press).  Restores 48 MHz PLL on wake.
+ *   3. Wait for button release (so wake press is not a game input).
+ *   4. display_init(): drives PA4/5/6 LOW (VCC on), re-configures SPI and
  *      display GPIOs, runs RST sequence, sends the full GC9107 init table.
- *   4. display_set_backlight(1): backlight on.
- *   5. app_wake(): app-specific redraw (default no-op).
+ *   5. display_set_backlight(1): backlight on.
+ *   6. app_wake(): app-specific redraw (default no-op).
  */
 #include "app.h"
 #include "config.h"
@@ -68,11 +70,22 @@ static void device_sleep(void) {
     SPI1->CR1 &= ~SPI_CR1_SPE;
     GPIOA->BSRR = (1UL << 4) | (1UL << 6);   /* PA4, PA6 HIGH = VCC OFF; PA5 untouched */
 
-    /* ── Step 2: Wait for button press then release ───────────────────── */
-    while ( (BTN_PORT->IDR & (1u << BTN_PIN))) { IWDG_FEED(); } /* await LOW  */
+    /* ── Step 2: Enter MCU Stop mode (~10-20 µA) until button press.
+     *   system_enter_stop() configures EXTI7 (PA7, falling edge) as event
+     *   wake source, sets PWR Stop mode + SCR SLEEPDEEP, executes WFE, then
+     *   on wake restores the 48 MHz PLL and recalibrates TIM1/TIM3.
+     *   Returns when the button press event is detected (falling edge on PA7).
+     *   IWDG continues on LSI in Stop mode (~26 s timeout).               */
+    IWDG_FEED();
+    system_enter_stop();
+
+    /* ── Step 3: Wait for button release before re-initialising display.
+     *   system_enter_stop() returned on the falling edge (press).  We must
+     *   wait for the rising edge (release) so the wake press does not register
+     *   as a game input on the first frame.                                 */
     while (!(BTN_PORT->IDR & (1u << BTN_PIN))) { IWDG_FEED(); } /* await HIGH */
 
-    /* ── Step 3: Restore VCC and reinitialize display.
+    /* ── Step 4: Restore VCC and reinitialize display.
      *   display_init() calls display_gpio_init() which drives PA4/5/6 LOW
      *   (VCC on), reconfigures SPI and display GPIOs, runs the RST sequence,
      *   and sends the full GC9107 init table.  GRAM is undefined after a VCC

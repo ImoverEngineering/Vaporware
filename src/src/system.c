@@ -162,6 +162,99 @@ void clock_boost_48mhz(void) {
     TIM3->CR1 = TIM_CR1_CEN;
 }
 
+void system_enter_stop(void) {
+    /* Enter N32G031 Stop mode and block until the button (PA7) is pressed.
+     *
+     * Stop mode: HSI and PLL halt, core powers down to ~10-20 µA.
+     *   IWDG continues on LSI (~40 kHz) — timeout ~26 s (PR=6, RLR=4095).
+     *   If no button press arrives within ~26 s, IWDG resets the MCU.
+     *
+     * Wake source: EXTI7 falling edge (PA7, active-LOW button).
+     *   Event mode (EXTI_EMR) chosen over interrupt mode (EXTI_IMR) so the
+     *   CPU wakes via WFE without an ISR or NVIC enable entry.
+     *   SEV + WFE + WFE idiom: SEV sets the event latch so the first WFE
+     *   clears it harmlessly; the second WFE enters Stop and waits for the
+     *   real EXTI7 event.
+     *
+     * Register map confirmed via factory firmware Ghidra analysis:
+     *   AFIO base    = 0x40010000
+     *   AFIO_EXTICR2 = AFIO + 0x0C (bits[15:12] select port for EXTI7)
+     *   EXTI_IMR  = 0x40010400   EXTI_EMR  = 0x40010404
+     *   EXTI_RTSR = 0x40010408   EXTI_FTSR = 0x4001040C
+     *   EXTI_PR   = 0x40010414
+     *   PWR_CR    = 0x40007000   (PDDS bit1, LPDS bit0)
+     *   SCR       = 0xE000ED10   (SLEEPDEEP bit2)
+     *
+     * Post-wake: Stop mode drops SYSCLK to HSI 8 MHz.
+     *   clock_boost_48mhz() restores 48 MHz PLL and recalibrates TIM3.
+     *   tim1_init() recalibrates TIM1 PSC (7999 → 47999 at 48 MHz).
+     *
+     * TIM3 is stopped in Stop mode (APB1 clock halts).  clock_boost_48mhz()
+     * re-issues EGR=UG and CEN, so delay_ms() is safe after this call returns.
+     * Do NOT call delay_ms() between WFE return and clock_boost_48mhz(). */
+
+    volatile uint32_t *AFIO_EXTICR2 = (volatile uint32_t *)0x4001000CUL;
+    volatile uint32_t *EXTI_IMR     = (volatile uint32_t *)0x40010400UL;
+    volatile uint32_t *EXTI_EMR     = (volatile uint32_t *)0x40010404UL;
+    volatile uint32_t *EXTI_RTSR    = (volatile uint32_t *)0x40010408UL;
+    volatile uint32_t *EXTI_FTSR    = (volatile uint32_t *)0x4001040CUL;
+    volatile uint32_t *EXTI_PR      = (volatile uint32_t *)0x40010414UL;
+    volatile uint32_t *PWR_CR       = (volatile uint32_t *)0x40007000UL;
+    volatile uint32_t *SCR          = (volatile uint32_t *)0xE000ED10UL;
+
+    /* 1. Enable AFIO clock (APB2ENR bit0) and PWR clock (APB1ENR bit28).
+     *    AFIO is needed to write EXTICR2 for EXTI7 port selection.
+     *    PWR is needed to access PWR_CR for Stop mode control. */
+    RCC->APB2ENR |= RCC_APB2ENR_AFIOEN;
+    RCC->APB1ENR |= (1UL << 28);            /* PWREN */
+
+    /* 2. Route EXTI7 to GPIOA: AFIO_EXTICR2 bits[15:12] = 0000 (GPIOA).
+     *    Clear the field only; other EXTI lines in this register left alone. */
+    *AFIO_EXTICR2 &= ~(0xFUL << 12);
+
+    /* 3. Configure EXTI7: event mode, falling edge, clear any pending flag. */
+    *EXTI_IMR  &= ~(1UL << 7);   /* disable interrupt on EXTI7 */
+    *EXTI_EMR  |=  (1UL << 7);   /* enable event on EXTI7 (WFE wake source) */
+    *EXTI_RTSR &= ~(1UL << 7);   /* no rising-edge trigger */
+    *EXTI_FTSR |=  (1UL << 7);   /* falling-edge trigger (button press) */
+    *EXTI_PR    =  (1UL << 7);   /* clear any stale pending bit (W1C) */
+
+    /* 4. PWR_CR: PDDS=0 (Stop mode, not Standby) + LPDS=1 (low-power regulator).
+     *    Low-power regulator saves ~5-10 µA vs main regulator in Stop mode.
+     *    PDDS is bit1, LPDS is bit0. */
+    *PWR_CR = (*PWR_CR & ~(1UL << 1)) | (1UL << 0);
+
+    /* 5. ARM SCR SLEEPDEEP (bit2) — tells core to enter deep sleep on WFE. */
+    *SCR |= (1UL << 2);
+
+    /* 6. Enter Stop mode via WFE.
+     *    SEV sets the internal event latch so the first WFE clears it and
+     *    returns immediately (no sleep).  The second WFE actually enters Stop
+     *    and blocks until EXTI7 fires a new event (button press). */
+    __asm volatile ("sev");
+    __asm volatile ("wfe");
+    __asm volatile ("wfe");
+
+    /* ── Execution resumes here after EXTI7 event (button pressed) ── */
+
+    /* 7. Clear SLEEPDEEP before any further instructions. */
+    *SCR &= ~(1UL << 2);
+
+    /* 8. Clean up EXTI7: disable event mask and clear pending. */
+    *EXTI_EMR &= ~(1UL << 7);
+    *EXTI_PR   =  (1UL << 7);
+
+    /* 9. Restore 48 MHz PLL.  Stop mode reverted SYSCLK to HSI 8 MHz.
+     *    clock_boost_48mhz() recalibrates TIM3 PSC (7→47) and asserts CEN,
+     *    so delay_ms() is accurate again immediately after this call. */
+    clock_boost_48mhz();
+
+    /* 10. Recalibrate TIM1 for 48 MHz (PSC 7999→47999 → still 1 kHz).
+     *     tim1_init() auto-detects PLL via RCC_CFGR_SWS_PLL and resets CNT.
+     *     ms_now() is accurate from this point. */
+    tim1_init();
+}
+
 void tim1_init(void) {
     /* Enable TIM1 clock on APB2 (TIM1EN = APB2ENR bit 11) */
     RCC->APB2ENR |= RCC_APB2ENR_TIM1EN;

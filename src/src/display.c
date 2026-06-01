@@ -433,6 +433,40 @@ void display_draw_image(const uint16_t *img, uint16_t x, uint16_t y,
     LCD_CS_HIGH();
 }
 
+void display_draw_sprite(const uint16_t *pixels, uint16_t x, uint16_t y,
+                         uint16_t w, uint16_t h, uint16_t transparent_color) {
+    /* Blit a w×h sprite at (x,y), skipping pixels that match transparent_color.
+     * Each row is scanned for contiguous runs of opaque pixels; each run is sent
+     * as a single display_draw_image call.  This eliminates tearing artifacts
+     * that would occur if transparent pixels were blitted as background color.
+     *
+     * Clipping: only columns within [0, LCD_WIDTH) are sent.  Rows are not
+     * clipped vertically — caller must ensure y+h <= LCD_HEIGHT.
+     *
+     * One IWDG_FEED per row to keep the watchdog happy during large sprites. */
+    for (uint16_t row = 0; row < h; row++) {
+        IWDG_FEED();
+        const uint16_t *rowp = pixels + (uint32_t)row * w;
+        uint16_t col = 0;
+        while (col < w) {
+            /* Skip transparent pixels */
+            while (col < w && rowp[col] == transparent_color) col++;
+            if (col >= w) break;
+            /* Find end of opaque run */
+            uint16_t run_start = col;
+            while (col < w && rowp[col] != transparent_color) col++;
+            /* Clip to display bounds */
+            uint16_t px = x + run_start;
+            uint16_t run_len = col - run_start;
+            if (px >= LCD_WIDTH) continue;
+            if ((uint32_t)px + run_len > LCD_WIDTH) run_len = LCD_WIDTH - px;
+            /* Blit this opaque run */
+            display_draw_image(rowp + run_start, px, (uint16_t)(y + row),
+                               run_len, 1);
+        }
+    }
+}
+
 void display_draw_chunk_2x(const uint16_t *src, uint16_t log_row,
                            uint16_t log_w, uint16_t log_h)
 {
