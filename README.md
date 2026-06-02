@@ -30,7 +30,7 @@ The device runs a Nations Tech **N32G031K8Q7-1** (ARM Cortex-M0) driving a 128×
 | **Display** | 128×160 IPS TFT, GC9107, RGB565, SPI @ 4 MHz |
 | **Button** | PA7, active-LOW |
 | **Battery** | 3.7 V LiPo, ~4.2 V full, measured via PB0 ADC |
-| **Coil** | PB0 MOSFET gate — HIGH = fire |
+| **Coil** | PB0 MOSFET gate — HIGH = fire (Changes depending on hardware version) |
 | **Debug** | SWD (PA13/PA14) via ST-Link V2 |
 
 Full pin table and peripheral map: [`docs/README.md`](docs/README.md)
