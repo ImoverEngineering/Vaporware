@@ -28,15 +28,16 @@ microcontroller driving a 128×160 GC9107 LCD.
 | LCD RST | PB6 | Active-LOW pulse at init |
 | LCD Backlight | PB4 | Active-LOW GPIO (LOW=on, HIGH=off). NOT PWM. |
 | Button | PA7 | Active-LOW, internal pull-up |
-| Battery ADC | PB0 | ADC1 channel 8 |
-| Coil gate | PB0 | Confirmed from fw_dump.bin Ghidra analysis. PB0 HIGH = coil on. |
+| Battery ADC | PA6 | ADC1 channel 6 (confirmed by live OpenOCD ADC scan 2026-05-29) |
+| Coil gate | **Varies** | HIGH = fire. PB0 from Ghidra analysis of one firmware dump, but PB0/PB8/PA5 all observed on different board variants. Scan before use — never write full MODER (kills SWD). |
 | SWD SWDIO | PA13 | Fixed Cortex-M0 SWD pin |
 | SWD SWCLK | PA14 | Fixed Cortex-M0 SWD pin |
 
-> **PB0 is shared**: it serves as both the battery ADC input (channel 8) and
-> the coil MOSFET gate. `bat_read_raw()` saves/restores MODER around ADC reads,
-> so interleaving ADC reads with coil control is safe. Avoid driving PB0 HIGH
-> during an ADC conversion.
+> **Coil pin varies by board variant**: PB0, PB8, and PA5 have all been observed
+> on different hardware revisions. Always scan the coil gate on a new board before
+> driving it — never write the full MODER register (masks out all bits and will
+> corrupt SWD on PA13/PA14). The battery ADC is on **PA6 (channel 6)**, confirmed
+> by live OpenOCD ADC scan. `bat_read_raw()` saves/restores MODER around ADC reads.
 
 ---
 
@@ -117,18 +118,20 @@ Additional display functions (not in the `app` framework path):
 
 ### `battery` — ADC Battery Monitor
 
-Reads PB0 (ADC channel 8) for battery voltage. `bat_read_raw()` temporarily
-switches PB0 to analog mode, triggers one conversion, and restores MODER.
+Reads **PA6 (ADC channel 6)** for battery voltage. `bat_read_raw()` temporarily
+switches PA6 to analog mode, triggers one conversion, and restores MODER.
+(Earlier docs incorrectly stated PB0/channel 8 — corrected 2026-05-29 via live ADC scan.)
 
-Voltage formula (empirical divider ~0.71):
+Voltage formula (empirical divider ≈ 0.71, VDDA = 3.0 V):
 ```
-Vbat = raw * 1.41 * 3.0 / 4096
+Vbat = raw * (1.0 / 0.71) * 3.0 / 4096
+     = raw * 1.41 * 3.0 / 4096
 ```
 
-Use the threshold constants from `config.h` directly:
-- `BAT_FULL` = 181 (≈ 3.70 V)
-- `BAT_WARN` = 146 (≈ 3.00 V)
-- `BAT_CRIT` = 122 (≈ 2.50 V)
+Use the threshold constants from `config.h` directly (12-bit, VDDA=3.0V):
+- `BAT_FULL` = 3582 (≈ 3.70 V — display full indicator)
+- `BAT_WARN` = 2906 (≈ 3.00 V — display low indicator)
+- `BAT_CRIT` = 2422 (≈ 2.50 V — force sleep immediately)
 
 ADC sample time is 239.5 cycles (longest available) because the ~96 kΩ
 Thevenin source impedance of the divider limits ADC capacitor charging.
@@ -159,9 +162,11 @@ See `include/nv.h` for the full key list (`NV_KEY_PUFF_COUNT`, `NV_KEY_HIGH_SCOR
 
 ### `vape` — Coil Safety Init
 
-`vape_safety_init()` is called before `clock_init()` to enable GPIO clocks.
-The coil gate (PB0) is not explicitly driven here — `bat_read_raw()` manages
-PB0 mode. Apps that fire the coil must configure PB0 as output and drive it HIGH.
+`vape_safety_init()` is called before `clock_init()` to enable GPIO clocks and
+hold the coil gate LOW before anything else runs. The coil gate pin **varies by
+board variant** (PB0, PB8, and PA5 have all been observed) — scan the actual pin
+on a new board before driving it. Apps that fire the coil must configure the
+correct pin as output and drive it HIGH.
 
 `vape_init()` is a no-op placeholder for future coil PWM or temp-sensing init.
 

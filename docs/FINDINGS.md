@@ -45,7 +45,7 @@ Note: SPI2 peripheral (0x40002800) is absent from all literal pool scans — fla
 | USART2 (0x40003000)| Debug/comms | Referenced at 0x2FAC–0x2FD8 |
 | DMA1 (0x40020000) | SPI/ADC DMA | Referenced at 0x19A8, 0x5384 |
 
-**Coil gate**: **PB0** confirmed as the coil MOSFET gate (HIGH = coil on). PA4/PA5 are NOT the coil — they were ruled out by live toggling with IWDG monitoring. PB0 is shared with the battery ADC (channel 8); `bat_read_raw()` saves/restores MODER around conversions so both uses are safe to interleave.
+**Coil gate**: **PB0** identified as the coil MOSFET gate in the Ghidra analysis of one firmware dump (HIGH = coil on). However, the coil gate pin **varies by board variant** — PB0, PB8, and PA5 have all been observed on different hardware revisions. Always scan the coil gate on a new board before driving it; never write the full MODER register (corrupts SWD). **Battery ADC is PA6 (channel 6)**, not PB0/channel 8 — corrected 2026-05-29 by live OpenOCD ADC scan.
 
 ## Key Firmware Functions
 
