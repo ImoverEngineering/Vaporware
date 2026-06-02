@@ -381,27 +381,47 @@ typedef struct {
 /* ---- IWDG (base = 0x40003000) ----
  *
  * Independent watchdog — clocked from the internal LSI oscillator (~40 kHz),
- * so it keeps running regardless of main clock state.
+ * so it keeps running regardless of main clock state, including Stop mode.
  *
  * Register map:
  *   KR  (+0x00): write-only key register.  Three magic values:
  *     0xAAAA — reload counter (feed/pat the dog)
  *     0x5555 — unlock PR and RLR for write
  *     0xCCCC — start the watchdog (if in software-start mode)
- *   PR  (+0x04): prescaler (0=LSI/4=~10kHz, 4=LSI/64=~625Hz, etc.)
- *   RLR (+0x08): reload value (counter reloads with this on feed)
+ *   PR  (+0x04): prescaler (0=LSI/4≈10kHz, 6=LSI/256≈156Hz)
+ *   RLR (+0x08): reload value (12-bit; counter reloads with this on feed)
+ *   SR  (+0x0C): status (bit0=PVU prescaler updating, bit1=RVU reload updating)
  *
- * In this firmware the IWDG is configured by hardware option bytes (assumed
- * hardware-start mode).  IWDG_START() is called at boot defensively in case
- * the device is in software-start mode.
+ * DEFAULT TIMEOUT WARNING: after reset, PR=0 (÷4) and RLR=0xFFF (4095),
+ * giving a timeout of only ~410 ms at LSI=40 kHz.  This is too short to
+ * survive Stop mode sleep without feeding.  IWDG_CONFIGURE_26S() must be
+ * called immediately after IWDG_START() to extend the timeout to ~26 s.
  *
- * delay_ms() feeds the IWDG every 1 ms, so the watchdog timeout must be set
- * longer than the longest blocking operation (LCD init ≈ 300 ms).
- * bat_read_raw() also feeds the IWDG during the conversion poll loop.
+ * Configured timeout (PR=6, RLR=4095):
+ *   LSI/256 = 156.25 Hz;  4096 / 156.25 ≈ 26.2 s
+ *   The IWDG continues counting in Stop mode — device wakes or IWDG fires
+ *   if no button press within ~26 s.  delay_ms() feeds every 1 ms so normal
+ *   operation (display refresh, game loop) is always well within budget.
  */
 #define IWDG_KR       (*(volatile uint32_t *)0x40003000UL)
-#define IWDG_FEED()   (IWDG_KR = 0xAAAAUL)   /* reload counter — call at least once per timeout period */
-#define IWDG_START()  (IWDG_KR = 0xCCCCUL)   /* safe to call even if already running */
+#define IWDG_PR_REG   (*(volatile uint32_t *)0x40003004UL)
+#define IWDG_RLR_REG  (*(volatile uint32_t *)0x40003008UL)
+#define IWDG_SR_REG   (*(volatile uint32_t *)0x4000300CUL)
+#define IWDG_FEED()   (IWDG_KR = 0xAAAAUL)   /* reload counter */
+#define IWDG_START()  (IWDG_KR = 0xCCCCUL)   /* start (safe to call even if already running) */
+
+/* Extend IWDG timeout to ~26 s (PR=6 ÷256, RLR=4095).
+ * Call immediately after IWDG_START().  The 0x5555 unlock write enables
+ * PR/RLR modification; the final IWDG_FEED() applies the new reload value.
+ * Until PVU/RVU bits in SR clear (~2 LSI cycles ≈ 50 µs), the old values
+ * are still active — but the counter has just been reloaded to the new RLR,
+ * so the first full timeout after this call is the full ~26 s. */
+#define IWDG_CONFIGURE_26S() do {        \
+    IWDG_KR      = 0x5555UL;            \
+    IWDG_PR_REG  = 6u;   /* LSI / 256 */\
+    IWDG_RLR_REG = 4095u;               \
+    IWDG_FEED();                        \
+} while (0)
 
 /* ---- NVIC ---- */
 #define NVIC_BASE       0xE000E100UL

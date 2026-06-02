@@ -25,13 +25,17 @@
  *
  * Startup sequence performed by the framework (in order):
  *   1. IWDG_START / IWDG_FEED
- *   2. clock_init()
- *   3. delay_ms(50)
- *   4. display_init() + display_set_backlight(1)
- *   5. tim1_init()
- *   6. button_init()
- *   7. app_init()           ← your code starts here
- *   8. frame loop           ← app_update() called every ~33 ms
+ *   2. vape_safety_init()   — coil gate forced LOW (safety-critical)
+ *   3. clock_init()         — HSI 8 MHz + TIM3 timebase
+ *   4. delay_ms(200)        — LDO + GC9107 power-rail settle
+ *   5. bat_init()           — ADC for battery reads
+ *   6. display_init()       — GPIO, SPI1, GC9107 init table, GRAM clear
+ *   7. display_set_backlight(1)
+ *   8. tim1_init()          — free-running 1 kHz wall clock (ms_now())
+ *   9. vape_init()          — puff sensor / coil hardware
+ *  10. button_init()        — PA7 input with pull-up
+ *  11. app_init()           ← your code starts here
+ *  12. frame loop           ← app_update() called every ~33 ms
  */
 #ifndef APP_H
 #define APP_H
@@ -64,19 +68,29 @@ void app_update(uint32_t frame);
 
 /* ── Optional weak callback ──────────────────────────────────────── */
 
-/* Called after the device wakes from display sleep (before the next frame).
+/* Called after the device wakes from sleep (before the next frame).
  * The default implementation is a no-op (weak symbol).
- * Override to trigger a full UI redraw — the display was blanked before sleep,
- * so anything drawn before sleep_in() is no longer visible.
+ * Override to redraw the full screen — display GRAM is cleared to black by
+ * display_init() during the wake sequence, so the previous frame is gone.
  * Called from within the framework's device_sleep() function in app.c. */
 void app_wake(void);
 
 /* ── Framework configuration — call from app_init() ─────────────── */
 
-/* Enable automatic display sleep after idle_ms of no button activity.
+/* Enable automatic sleep after idle_ms of no button activity.
  * "Activity" is defined as button_pressed() returning non-zero.
- * On sleep, all GPIO pins go high-Z, display_sleep_in() is called,
- * and the loop blocks until the button is pressed and released.
+ *
+ * Sleep protocol (app.c device_sleep()):
+ *   1. SPI disabled + PA4/PA6 HIGH → display VCC cut → screen dark.
+ *      (PA5 is never touched — it is the coil gate on some board variants.)
+ *   2. MCU enters Stop mode via system_enter_stop() (~10-20 µA on N32G031).
+ *      EXTI7 falling edge (PA7 button) is the wake source.
+ *      IWDG continues on LSI; MCU resets if button not pressed in ~26 s.
+ *   3. Wake: 48 MHz PLL restored, button release waited.
+ *   4. display_init(): VCC back on, SPI re-init, full GC9107 init + black fill.
+ *   5. display_set_backlight(1): backlight on.
+ *   6. app_wake(): your redraw hook fires.
+ *
  * Pass idle_ms=0 to disable auto-sleep entirely. */
 void app_set_sleep_timeout(uint16_t idle_ms);
 

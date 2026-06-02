@@ -70,8 +70,13 @@
 #define NV_NUM_KEYS     8
 
 /* ── App framework ────────────────────────────────────────────────────
- * FRAME_MS controls the target frame period (~30 fps at 33 ms).      */
-#define APP_FRAME_MS    33U
+ * FRAME_MS: target frame period (~30 fps at 33 ms).
+ * BTN_HOLD_WAKE_MS: PA7 must stay LOW continuously for this many ms
+ *   after waking from Stop mode to be accepted as a genuine button press.
+ *   Spurious wakes from board transients last microseconds to low tens of
+ *   ms; real presses last 200 ms+.  Increase if spurious wakes persist.  */
+#define APP_FRAME_MS       33U
+#define BTN_HOLD_WAKE_MS   50U
 
 /* ── SWD debug pins (Cortex-M0 fixed, do not reassign) ───────────────
  * PA13 = SWDIO, PA14 = SWCLK.  Restored during sleep so the debugger

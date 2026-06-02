@@ -81,4 +81,22 @@ static inline uint16_t ms_now(void) {
     return (uint16_t)TIM1->CNT;
 }
 
+/* Enter N32G031 Stop mode (~10-20 µA) and block until the button (PA7) is
+ * pressed.
+ *
+ * Configures EXTI7 falling-edge event wake, sets PWR_CR Stop mode + SCR
+ * SLEEPDEEP, executes SEV/WFE/WFE to enter Stop, then on wake restores the
+ * 48 MHz PLL (clock_boost_48mhz()) and recalibrates TIM1 (tim1_init()).
+ *
+ * Returns after the button press event is detected.  The caller is
+ * responsible for waiting for button release before re-initialising the
+ * display.
+ *
+ * IWDG continues to run on LSI in Stop mode (~40 kHz, ~26 s timeout).
+ * If the button is not pressed within ~26 s the IWDG will reset the MCU.
+ *
+ * SAFETY: caller must ensure PA5 is LOW (coil gate) before calling.  This
+ * function does not touch PA5. */
+void system_enter_stop(void);
+
 #endif /* SYSTEM_H */
