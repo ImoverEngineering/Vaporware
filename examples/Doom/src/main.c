@@ -123,32 +123,6 @@ static void spawn_enemy(void) {
     enemy_hp = enemy_max_hp;
 }
 
-static void draw_block_letter(uint8_t id, uint16_t x, uint16_t y, uint16_t s, uint16_t c) {
-    /* Seven-segment-ish letters: D O O M P R E S W I N */
-    uint8_t top=0, mid=0, bot=0, ul=0, ur=0, ll=0, lr=0;
-    switch (id) {
-        case 'D': top=bot=ul=ll=ur=lr=1; break;
-        case 'O': top=bot=ul=ll=ur=lr=1; break;
-        case 'M': ul=ll=ur=lr=top=1; mid=1; break;
-        case 'P': top=mid=ul=ur=ll=1; break;
-        case 'R': top=mid=ul=ur=ll=lr=1; break;
-        case 'A': top=mid=ul=ll=ur=lr=1; break;
-        case 'E': top=mid=bot=ul=ll=1; break;
-        case 'S': top=mid=bot=ul=lr=1; break;
-        case 'W': ul=ll=ur=lr=bot=1; mid=1; break;
-        case 'I': top=bot=1; rect(x+s, y, s, 5*s, c); return;
-        case 'N': ul=ll=ur=lr=1; rect(x+s, y+s, s, s, c); rect(x+2*s, y+2*s, s, s, c); break;
-        default: break;
-    }
-    if (top) rect(x, y, 4*s, s, c);
-    if (mid) rect(x, y+2*s, 4*s, s, c);
-    if (bot) rect(x, y+4*s, 4*s, s, c);
-    if (ul) rect(x, y, s, 3*s, c);
-    if (ur) rect(x+3*s, y, s, 3*s, c);
-    if (ll) rect(x, y+2*s, s, 3*s, c);
-    if (lr) rect(x+3*s, y+2*s, s, 3*s, c);
-}
-
 static void draw_title(void) {
     doom_title_letterbox_draw();
     rect(34, 140, 60, 4, C_FIRE);
@@ -418,15 +392,82 @@ static void start_game(void) {
     redraw_all = 1;
 }
 
+static void draw_banner_glyph(const uint8_t rows[7], uint16_t x, uint16_t y,
+                              uint16_t s, uint16_t c) {
+    for (uint8_t row = 0; row < 7; row++) {
+        for (uint8_t col = 0; col < 5; col++) {
+            if (rows[row] & (1U << (4U - col))) {
+                rect((uint16_t)(x + col * s), (uint16_t)(y + row * s), s, s, c);
+            }
+        }
+    }
+}
+
+static void draw_victory_banner(void) {
+    static const uint8_t glyphs[7][7] = {
+        {0x11, 0x11, 0x11, 0x11, 0x0A, 0x0A, 0x04}, /* V */
+        {0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x1F}, /* I */
+        {0x0F, 0x10, 0x10, 0x10, 0x10, 0x10, 0x0F}, /* C */
+        {0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04}, /* T */
+        {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E}, /* O */
+        {0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11}, /* R */
+        {0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04}, /* Y */
+    };
+    const uint16_t shadow = COL_RGB(0, 88, 0);
+    const uint16_t hi = COL_RGB(122, 255, 92);
+    const uint16_t mid = C_GREEN;
+    uint16_t x = 4;
+    uint16_t y = 68;
+    const uint16_t scale = 3;
+
+    for (uint8_t i = 0; i < 7; i++) {
+        draw_banner_glyph(glyphs[i], (uint16_t)(x + 1U), (uint16_t)(y + 2U), scale, shadow);
+        draw_banner_glyph(glyphs[i], x, y, scale, mid);
+        draw_banner_glyph(glyphs[i], x, y, scale, hi);
+        rect(x, y, (uint16_t)(5U * scale), 1, hi);
+        x = (uint16_t)(x + 17U);
+    }
+
+    rect(12, 91, 104, 2, hi);
+    rect(10, 93, 108, 2, mid);
+}
+
 static void draw_end(uint8_t win) {
     display_fill(win ? COL_RGB(0, 30, 0) : COL_RGB(40, 0, 0));
     if (win) {
-        draw_block_letter('W', 25, 30, 5, C_GREEN);
-        draw_block_letter('I', 53, 30, 5, C_GREEN);
-        draw_block_letter('N', 75, 30, 5, C_GREEN);
-        rect(20, 92, 88, 7, C_HUD2);
-        rect(30, 108, 68, 7, C_HUD2);
-        rect(40, 124, 48, 7, C_FIRE);
+        display_fill(COL_RGB(76, 67, 47));
+        rect(0, 18, 128, 126, COL_RGB(58, 58, 58));
+        rect(0, 18, 128, 2, COL_RGB(120, 125, 104));
+        rect(0, 142, 128, 2, COL_RGB(34, 34, 34));
+        rect(0, 20, 4, 122, COL_RGB(190, 190, 170));
+        rect(4, 20, 2, 122, COL_RGB(86, 86, 76));
+        rect(0, 144, 128, 16, COL_RGB(22, 22, 22));
+
+        for (uint8_t i = 0; i < 7; i++) {
+            uint16_t y = (uint16_t)(24U + i * 10U);
+            rect(1, y, 3, 7, COL_RGB(132, 132, 124));
+            rect(2, (uint16_t)(y + 1U), 1, 5, COL_RGB(92, 92, 88));
+        }
+
+        for (uint8_t i = 0; i < 5; i++) {
+            uint16_t y = (uint16_t)(38U + i * 24U);
+            rect(6, y, 122, 1, COL_RGB(38, 38, 38));
+            rect(6, (uint16_t)(y + 1U), 122, 1, COL_RGB(92, 92, 92));
+        }
+
+        rect(10, 54, 28, 1, COL_RGB(45, 45, 45));
+        rect(90, 54, 28, 1, COL_RGB(45, 45, 45));
+        rect(10, 102, 28, 1, COL_RGB(45, 45, 45));
+        rect(90, 102, 28, 1, COL_RGB(45, 45, 45));
+        draw_victory_banner();
+
+        for (uint8_t i = 0; i < 8; i++) {
+            uint16_t x = (uint16_t)(i * 16U);
+            rect(x, 144, 8, 16, C_BLOOD);
+            rect((uint16_t)(x + 8U), 144, 8, 16, COL_RGB(18, 18, 18));
+            rect((uint16_t)(x + 2U), 144, 3, 16, COL_RGB(255, 110, 110));
+            rect((uint16_t)(x + 10U), 144, 3, 16, C_DARK);
+        }
     } else {
         doom_deathscreen_draw();
         rect(0, 0, 128, 6, COL_RGB(18, 0, 0));

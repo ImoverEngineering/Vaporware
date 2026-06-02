@@ -29,6 +29,15 @@ static void spi_write_byte(uint8_t byte) {
     while (SPI1->SR & SPI_SR_BSY);
 }
 
+static void spi_write_byte_queued(uint8_t byte) {
+    while (!(SPI1->SR & SPI_SR_TXE));
+    *(volatile uint8_t *)&SPI1->DR = byte;
+}
+
+static void spi_drain_after_burst(void) {
+    for (volatile uint32_t _d = 300u; _d--; );
+}
+
 static void lcd_write_cmd(uint8_t cmd) {
     LCD_DC_CMD();
     spi_write_byte(cmd);
@@ -273,11 +282,12 @@ void display_fill(uint16_t color) {
     for (uint16_t row = 0; row < LCD_HEIGHT; row++) {
         IWDG_FEED();
         for (uint16_t col = 0; col < LCD_WIDTH; col++) {
-            spi_write_byte(hi);
-            spi_write_byte(lo);
+            spi_write_byte_queued(hi);
+            spi_write_byte_queued(lo);
         }
     }
     *(volatile uint32_t *)0x2000009CUL = 0xEE440000UL;
+    spi_drain_after_burst();
     LCD_CS_HIGH();
 }
 
@@ -291,10 +301,11 @@ void display_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t 
     for (uint16_t row = 0; row < h; row++) {
         IWDG_FEED();
         for (uint16_t col = 0; col < w; col++) {
-            spi_write_byte(hi);
-            spi_write_byte(lo);
+            spi_write_byte_queued(hi);
+            spi_write_byte_queued(lo);
         }
     }
+    spi_drain_after_burst();
     LCD_CS_HIGH();
 }
 
@@ -310,10 +321,11 @@ void display_draw_image(const uint16_t *img, uint16_t x, uint16_t y,
         const uint16_t *rowp = img + (uint32_t)row * w;
         for (uint16_t col = 0; col < w; col++) {
             uint16_t px = rowp[col];
-            spi_write_byte((uint8_t)(px >> 8));
-            spi_write_byte((uint8_t)(px & 0xFF));
+            spi_write_byte_queued((uint8_t)(px >> 8));
+            spi_write_byte_queued((uint8_t)(px & 0xFF));
         }
     }
+    spi_drain_after_burst();
     LCD_CS_HIGH();
 }
 
@@ -345,10 +357,14 @@ void display_draw_chunk_2x(const uint16_t *src, uint16_t log_row,
                 uint16_t px = row[lc];
                 uint8_t  hi = (uint8_t)(px >> 8);
                 uint8_t  lo = (uint8_t)(px & 0xFFu);
-                while (!(SPI1->SR & SPI_SR_TXE)); *(volatile uint8_t *)&SPI1->DR = hi;
-                while (!(SPI1->SR & SPI_SR_TXE)); *(volatile uint8_t *)&SPI1->DR = lo;
-                while (!(SPI1->SR & SPI_SR_TXE)); *(volatile uint8_t *)&SPI1->DR = hi;
-                while (!(SPI1->SR & SPI_SR_TXE)); *(volatile uint8_t *)&SPI1->DR = lo;
+                while (!(SPI1->SR & SPI_SR_TXE));
+                *(volatile uint8_t *)&SPI1->DR = hi;
+                while (!(SPI1->SR & SPI_SR_TXE));
+                *(volatile uint8_t *)&SPI1->DR = lo;
+                while (!(SPI1->SR & SPI_SR_TXE));
+                *(volatile uint8_t *)&SPI1->DR = hi;
+                while (!(SPI1->SR & SPI_SR_TXE));
+                *(volatile uint8_t *)&SPI1->DR = lo;
             }
         }
     }
@@ -395,8 +411,10 @@ void display_draw_chunk_cpu(const uint16_t *buf, uint16_t row_start, uint16_t nr
     uint32_t npix = (uint32_t)LCD_WIDTH * nrows;
     for (uint32_t i = 0; i < npix; i++) {
         uint16_t px = buf[i];
-        while (!(SPI1->SR & SPI_SR_TXE)); *(volatile uint8_t *)&SPI1->DR = (uint8_t)(px >> 8);
-        while (!(SPI1->SR & SPI_SR_TXE)); *(volatile uint8_t *)&SPI1->DR = (uint8_t)(px & 0xFF);
+        while (!(SPI1->SR & SPI_SR_TXE));
+        *(volatile uint8_t *)&SPI1->DR = (uint8_t)(px >> 8);
+        while (!(SPI1->SR & SPI_SR_TXE));
+        *(volatile uint8_t *)&SPI1->DR = (uint8_t)(px & 0xFF);
     }
     /* Fixed drain: BSY/TXE polling deadlocks on N32G031 after TXE-only bursts.
      * 300 cycles @ 48 MHz ≈ 6.25 µs = 2× byte-time at 3 MHz SPI — enough for
