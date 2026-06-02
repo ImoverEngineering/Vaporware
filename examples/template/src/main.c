@@ -4,10 +4,10 @@
  * This file is the ONLY file you need to write.  The framework handles:
  *   - Hardware init (clocks, display, SPI, button, battery, IWDG)
  *   - ~30 fps frame loop with IWDG feeding
- *   - Auto-sleep after configurable idle timeout
+ *   - Auto-sleep after configurable idle timeout (MCU Stop mode, ~10-20 µA)
  *   - Hold-button-to-reset with configurable duration and callback
  *   - Persistent NV storage (survives power cycles)
- *   - Safe deep sleep (all GPIO high-Z; SWD stays live for reflashing)
+ *   - Safe deep sleep: VCC cut (PA4+PA6 HIGH), MCU Stop mode via EXTI7 wake
  *
  * You implement three functions:
  *   app_init()       — called once after all hardware is up
@@ -72,9 +72,10 @@ void app_update(uint32_t frame) {
 }
 
 void app_wake(void) {
-    /* Called after the device wakes from sleep.
-     * Redraw the full screen — display RAM is intact but SPI lines were
-     * floating, so pixels may be corrupted.                            */
+    /* Called after the device wakes from Stop-mode sleep.
+     * display_init() already ran (GRAM cleared to black) — redraw your full UI.
+     * Also reset any physics timers (e.g. g_phys_t = ms_now()) so there is no
+     * catch-up burst of logic ticks from the sleep gap.                        */
     display_fill(COL_RGB(0, 0, 0));
     /* TODO: redraw your UI here */
 }
