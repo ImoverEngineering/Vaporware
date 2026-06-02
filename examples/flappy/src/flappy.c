@@ -73,7 +73,7 @@
  * Battery — thresholds and raw reading via vaporware battery.h/battery.c
  * BAT_FULL, BAT_WARN, BAT_CRIT, bat_init(), bat_read_raw() from battery.h
  * =================================================================== */
-static uint16_t g_bat_raw = 205u;  /* default = fully charged */
+static uint16_t g_bat_raw = BAT_FULL;  /* default = fully charged (3582) */
 
 /* ===================================================================
  * Bird sprites — 17×12 px, 3 wing frames
