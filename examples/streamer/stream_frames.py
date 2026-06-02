@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """stream_frames.py — Stream frames to the N32G031 vape display via SWD.
 
-Requires: pip install pillow mss
+Requires: pip install pillow mss dxcam
 OpenOCD must be installed in WSL (used instead of pyocd — more reliable on
 this hardware). The ST-Link is attached to WSL automatically on startup.
 
@@ -63,6 +63,13 @@ try:
     HAS_NUMPY = True
 except ImportError:
     HAS_NUMPY = False
+
+try:
+    import dxcam
+    HAS_DXCAM = True
+except Exception:
+    # dxcam fails on ARM64 Python (OSError in DXGI init) and some GPU configs
+    HAS_DXCAM = False
 
 # ── Protocol ──────────────────────────────────────────────────────────────────
 # Half-resolution 2× mode: 64×80 logical pixels → 128×160 physical pixels.
@@ -715,8 +722,22 @@ def test_chunk_gen():
 
 def screen_frames(bbox):
     x, y, w, h = bbox
-    if HAS_MSS:
-        with mss.mss() as sct:
+    if HAS_DXCAM:
+        # dxcam uses DXGI Desktop Duplication — captures GPU-composited frames
+        # including hardware-accelerated video overlays that mss/GDI miss.
+        camera = dxcam.create(output_color="RGB")
+        region = (x, y, x + w, y + h)
+        camera.start(region=region, target_fps=30)
+        try:
+            while True:
+                frame = camera.get_latest_frame()
+                if frame is not None:
+                    yield Image.fromarray(frame, "RGB")
+        finally:
+            camera.stop()
+            camera.release()
+    elif HAS_MSS:
+        with mss.MSS() as sct:
             region = {"left": x, "top": y, "width": w, "height": h}
             while True:
                 shot = sct.grab(region)
@@ -778,7 +799,7 @@ def window_frames(title):
                 continue
             if HAS_MSS:
                 import mss as _mss
-                with _mss.mss() as sct:
+                with _mss.MSS() as sct:
                     region = {"left": left, "top": top, "width": w, "height": h}
                     while True:
                         # Re-check window is still there
@@ -897,7 +918,7 @@ def main():
             bbox = tuple(int(v) for v in args.screen)
         else:
             if HAS_MSS:
-                with mss.mss() as sct:
+                with mss.MSS() as sct:
                     m = sct.monitors[1]
                     bbox = (m["left"], m["top"], m["width"], m["height"])
             else:
