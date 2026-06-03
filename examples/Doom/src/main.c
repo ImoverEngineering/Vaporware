@@ -49,6 +49,9 @@
 #define ENEMY_TYPES 7U
 #define BOSS_KIND 7U
 #define BOSS_KILLS 6U
+#define HALLWAY_COUNT 3U
+#define HEALTH_ON_KILL 5U
+#define ENEMY_LIFT 15U
 
 static uint8_t mode;
 static uint8_t redraw_all;
@@ -69,6 +72,7 @@ static uint8_t boss_pending;
 static uint8_t flash_frames;
 static uint8_t hurt_frames;
 static uint8_t last_hold;
+static uint8_t hallway_style;
 
 static void rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t c) {
     if (x >= LCD_WIDTH || y >= LCD_HEIGHT || w == 0 || h == 0) return;
@@ -126,27 +130,6 @@ static void spawn_enemy(void) {
 static void draw_title(void) {
     doom_title_letterbox_draw();
     rect(34, 140, 60, 4, C_FIRE);
-}
-
-static void draw_light_strip(uint16_t y, uint8_t phase) {
-    for (uint8_t i = 0; i < 4; i++) {
-        uint16_t x = (uint16_t)(18 + i * 28 + ((phase + i) & 3));
-        rect(x, y, 12, 3, COL_RGB(220, 190, 120));
-        rect(x + 2, y + 3, 8, 1, COL_RGB(80, 65, 42));
-    }
-}
-
-static void draw_grit(uint8_t phase) {
-    for (uint8_t i = 0; i < 20; i++) {
-        uint16_t x = (uint16_t)((i * 19U + phase * 3U) & 127U);
-        uint16_t y = (uint16_t)(7U + ((i * 11U + phase) % 44U));
-        rect(x, y, (i & 3U) ? 2U : 3U, 1, (i & 1U) ? COL_RGB(33, 34, 43) : COL_RGB(21, 22, 29));
-    }
-    for (uint8_t i = 0; i < 32; i++) {
-        uint16_t x = (uint16_t)((i * 23U + phase * 5U) & 127U);
-        uint16_t y = (uint16_t)(82U + ((i * 9U + phase * 2U) % 50U));
-        rect(x, y, (i & 1U) ? 2U : 3U, 2, (i & 1U) ? C_FLOOR2 : COL_RGB(24, 21, 18));
-    }
 }
 
 static void draw_sprite_scaled(const doom_enemy_sprite_t *sprite, int16_t x, int16_t y, uint16_t w, uint16_t h) {
@@ -221,10 +204,10 @@ static void draw_enemy_sprite(uint32_t frame) {
     draw_x = (int16_t)(64 - (int16_t)(draw_w / 2U));
 
     if (grounded[enemy_kind]) {
-        draw_y = (int16_t)(floor_y[enemy_kind] - draw_h);
+        draw_y = (int16_t)(floor_y[enemy_kind] - draw_h - ENEMY_LIFT);
     } else {
         int16_t bob = (pulse & 1U) ? -1 : 1;
-        draw_y = (int16_t)(hover_y[enemy_kind] - (int16_t)(draw_h / 2U) + bob);
+        draw_y = (int16_t)(hover_y[enemy_kind] - (int16_t)(draw_h / 2U) - (int16_t)ENEMY_LIFT + bob);
     }
 
     draw_sprite_scaled(sprite, draw_x, draw_y, draw_w, draw_h);
@@ -234,10 +217,7 @@ static void draw_enemy_sprite(uint32_t frame) {
     }
 }
 
-static void draw_world(uint32_t frame) {
-    uint8_t phase = (uint8_t)((zpos >> 4) & 7U);
-
-    /* Doom-ish techbase corridor: cleaner broad shapes, less visual noise. */
+static void draw_hallway_tech(uint8_t phase, uint32_t zphase) {
     rect(0, 0, 128, 56, COL_RGB(9, 10, 15));
     rect(0, 56, 128, 20, C_WALL_B);
     rect(0, 76, 128, 60, C_FLOOR);
@@ -245,16 +225,31 @@ static void draw_world(uint32_t frame) {
     rect(18, 5, 92, 3, COL_RGB(22, 22, 30));
     rect(28, 24, 72, 2, COL_RGB(28, 28, 38));
     rect(36, 44, 56, 3, COL_RGB(24, 18, 18));
-    draw_light_strip(13, phase);
-    draw_light_strip(33, (uint8_t)(phase + 2));
-    draw_grit(phase);
 
-    for (uint8_t y = 86; y < 136; y += 12) {
-        uint8_t shift = (uint8_t)((zpos >> 3) & 15U);
+    for (uint8_t i = 0; i < 4U; i++) {
+        uint16_t x = (uint16_t)(18U + i * 28U + ((phase + i) & 3U));
+        rect(x, 13, 12, 3, COL_RGB(220, 190, 120));
+        rect((uint16_t)(x + 2U), 16, 8, 1, COL_RGB(80, 65, 42));
+        rect(x, 33, 12, 3, COL_RGB(220, 190, 120));
+        rect((uint16_t)(x + 2U), 36, 8, 1, COL_RGB(80, 65, 42));
+    }
+
+    for (uint8_t i = 0; i < 20U; i++) {
+        uint16_t x = (uint16_t)((i * 19U + phase * 3U) & 127U);
+        uint16_t y = (uint16_t)(7U + ((i * 11U + phase) % 44U));
+        rect(x, y, (i & 3U) ? 2U : 3U, 1, (i & 1U) ? COL_RGB(33, 34, 43) : COL_RGB(21, 22, 29));
+    }
+    for (uint8_t i = 0; i < 32U; i++) {
+        uint16_t x = (uint16_t)((i * 23U + phase * 5U) & 127U);
+        uint16_t y = (uint16_t)(82U + ((i * 9U + phase * 2U) % 50U));
+        rect(x, y, (i & 1U) ? 2U : 3U, 2, (i & 1U) ? C_FLOOR2 : COL_RGB(24, 21, 18));
+    }
+
+    for (uint8_t y = 86U; y < 136U; y = (uint8_t)(y + 12U)) {
         rect(0, y, 128, 1, C_FLOOR2);
-        rect(16 + shift, y + 5, 96, 1, COL_RGB(25, 22, 20));
-        rect(46, y + 2, 3, 6, COL_RGB(68, 56, 42));
-        rect(79, y + 2, 3, 6, COL_RGB(68, 56, 42));
+        rect((uint16_t)(16U + zphase), (uint16_t)(y + 5U), 96, 1, COL_RGB(25, 22, 20));
+        rect(46, (uint16_t)(y + 2U), 3, 6, COL_RGB(68, 56, 42));
+        rect(79, (uint16_t)(y + 2U), 3, 6, COL_RGB(68, 56, 42));
     }
     rect(42, 82, 44, 54, COL_RGB(42, 35, 28));
     rect(47, 84, 34, 1, COL_RGB(82, 70, 55));
@@ -262,7 +257,6 @@ static void draw_world(uint32_t frame) {
     rect(52, 114, 24, 1, COL_RGB(82, 70, 55));
     rect(55, 130, 18, 1, COL_RGB(82, 70, 55));
 
-    /* Broad perspective walls. */
     rect(0, 44, 26, 92, C_PANEL);
     rect(102, 44, 26, 92, C_PANEL);
     rect(26, 54, 8, 72, C_METAL);
@@ -277,44 +271,143 @@ static void draw_world(uint32_t frame) {
     rect(12, 48, 4, 86, COL_RGB(38, 22, 22));
     rect(112, 48, 4, 86, COL_RGB(38, 22, 22));
 
-    /* Panel detail, animated just enough to sell movement at 2 FPS. */
     rect(4, 54, 16, 7, C_WALL_C);
     rect(108, 54, 16, 7, C_WALL_C);
     rect(5, 72, 15, 4, C_STRIPE);
     rect(108, 72, 15, 4, C_STRIPE);
-    rect(8, 92 + phase, 10, 18, C_METAL);
-    rect(110, 92 + phase, 10, 18, C_METAL);
+    rect(8, (uint16_t)(92U + phase), 10, 18, C_METAL);
+    rect(110, (uint16_t)(92U + phase), 10, 18, C_METAL);
     rect(35, 83, 9, 3, C_STRIPE);
     rect(84, 83, 9, 3, C_STRIPE);
     rect(52, 57, 24, 9, C_WALL_A);
     rect(55, 60, 18, 3, C_METAL);
-    for (uint8_t i = 0; i < 7; i++) {
+    for (uint8_t i = 0; i < 7U; i++) {
         uint16_t y = (uint16_t)(49U + i * 12U);
         rect(3, y, 5, 3, (i & 1U) ? C_WALL_B : COL_RGB(95, 39, 31));
         rect(120, y, 5, 3, (i & 1U) ? COL_RGB(95, 39, 31) : C_WALL_B);
         rect(28, (uint16_t)(y + 4U), 3, 3, COL_RGB(116, 120, 120));
         rect(97, (uint16_t)(y + 4U), 3, 3, COL_RGB(116, 120, 120));
     }
-    for (uint8_t i = 0; i < 5; i++) {
+    for (uint8_t i = 0; i < 5U; i++) {
         uint16_t y = (uint16_t)(60U + i * 14U);
         rect(17, y, 7, 1, COL_RGB(150, 52, 30));
         rect(104, y, 7, 1, COL_RGB(150, 52, 30));
         rect(35, (uint16_t)(y + 7U), 6, 2, COL_RGB(52, 54, 58));
         rect(87, (uint16_t)(y + 7U), 6, 2, COL_RGB(52, 54, 58));
     }
+}
 
-    /* Door/end marker */
-    if (zpos > 1320) {
-        uint8_t s = (uint8_t)((zpos - 1320) >> 4);
-        if (s > 30) s = 30;
-        rect(64 - s, 38 - s/2, s*2, 56 + s, C_METAL);
-        rect(64 - s + 4, 42 - s/2, (uint16_t)(s*2 - 8), 48 + s, COL_RGB(70, 54, 34));
-        rect(61, 59, 6, 20, C_DARK);
-        rect(54, 46, 20, 3, C_STRIPE);
-    } else {
-        rect(54, 48, 20, 18, C_DARK);
-        rect(57, 51, 14, 12, COL_RGB(68, 48, 35));
-    }
+static void draw_hallway_stone(void) {
+    const uint16_t ceiling_a = COL_RGB(98, 76, 54);
+    const uint16_t ceiling_b = COL_RGB(78, 59, 41);
+    const uint16_t wall_a = COL_RGB(114, 86, 60);
+    const uint16_t wall_b = COL_RGB(93, 68, 46);
+    const uint16_t wall_c = COL_RGB(71, 52, 37);
+    const uint16_t trim_a = COL_RGB(147, 119, 84);
+    const uint16_t trim_b = COL_RGB(56, 42, 29);
+    const uint16_t floor_a = COL_RGB(108, 82, 58);
+    const uint16_t floor_b = COL_RGB(88, 66, 46);
+    /* Keep draw count low so the hallway finishes before the next frame. */
+    rect(0, 0, 128, 136, wall_c);
+    rect(0, 0, 128, 10, trim_b);
+    rect(0, 136, 128, 2, C_DARK);
+
+    rect(0, 14, 38, 122, wall_a);
+    rect(90, 14, 38, 122, wall_a);
+    rect(38, 22, 8, 108, wall_b);
+    rect(82, 22, 8, 108, wall_b);
+
+    rect(38, 22, 52, 12, ceiling_a);
+    rect(46, 34, 36, 10, ceiling_b);
+    rect(54, 44, 20, 6, ceiling_a);
+    rect(38, 114, 52, 16, floor_a);
+    rect(46, 102, 36, 12, floor_b);
+    rect(54, 94, 20, 8, floor_a);
+
+    rect(4, 34, 24, 18, wall_c);
+    rect(100, 34, 24, 18, wall_c);
+    rect(4, 70, 24, 20, wall_c);
+    rect(100, 70, 24, 20, wall_c);
+    rect(4, 108, 24, 16, wall_c);
+    rect(100, 108, 24, 16, wall_c);
+
+    rect(28, 30, 6, 92, trim_a);
+    rect(94, 30, 6, 92, trim_a);
+    rect(46, 38, 3, 86, trim_b);
+    rect(79, 38, 3, 86, trim_b);
+
+    rect(34, 34, 60, 1, trim_a);
+    rect(42, 52, 44, 1, trim_a);
+    rect(48, 70, 32, 1, trim_a);
+    rect(34, 113, 60, 1, trim_b);
+    rect(42, 101, 44, 1, trim_b);
+    rect(48, 93, 32, 1, trim_b);
+
+    rect(56, 48, 16, 22, trim_b);
+    rect(58, 50, 12, 18, wall_b);
+    rect(61, 53, 6, 12, C_DARK);
+}
+
+static void draw_hallway_hell(void) {
+    const uint16_t sky_a = COL_RGB(168, 0, 0);
+    const uint16_t sky_b = COL_RGB(120, 0, 0);
+    const uint16_t wall_a = COL_RGB(146, 122, 92);
+    const uint16_t wall_b = COL_RGB(126, 102, 75);
+    const uint16_t line_a = COL_RGB(196, 172, 138);
+    const uint16_t line_b = COL_RGB(72, 44, 32);
+    const uint16_t floor_a = COL_RGB(42, 42, 46);
+    const uint16_t floor_b = COL_RGB(22, 22, 24);
+
+    rect(0, 0, 128, 136, sky_b);
+    rect(0, 0, 128, 20, sky_a);
+    rect(0, 20, 128, 18, COL_RGB(138, 0, 0));
+    rect(0, 136, 128, 2, C_DARK);
+
+    rect(0, 40, 40, 96, wall_a);
+    rect(88, 40, 40, 96, wall_a);
+    rect(40, 52, 8, 84, wall_b);
+    rect(80, 52, 8, 84, wall_b);
+
+    rect(40, 114, 48, 22, floor_a);
+    rect(48, 102, 32, 12, floor_b);
+    rect(54, 92, 20, 10, floor_a);
+
+    rect(6, 52, 22, 18, COL_RGB(116, 94, 68));
+    rect(100, 52, 22, 18, COL_RGB(116, 94, 68));
+    rect(6, 84, 22, 20, COL_RGB(116, 94, 68));
+    rect(100, 84, 22, 20, COL_RGB(116, 94, 68));
+    rect(6, 116, 22, 14, COL_RGB(116, 94, 68));
+    rect(100, 116, 22, 14, COL_RGB(116, 94, 68));
+
+    rect(30, 48, 6, 80, line_a);
+    rect(92, 48, 6, 80, line_a);
+    rect(48, 64, 3, 64, line_b);
+    rect(77, 64, 3, 64, line_b);
+
+    rect(36, 52, 56, 1, sky_a);
+    rect(44, 70, 40, 1, line_a);
+    rect(50, 86, 28, 1, line_a);
+    rect(36, 113, 56, 1, line_b);
+    rect(44, 101, 40, 1, line_b);
+    rect(50, 91, 28, 1, line_b);
+
+    rect(54, 72, 20, 64, COL_RGB(70, 12, 12));
+    rect(57, 75, 14, 58, COL_RGB(46, 8, 8));
+    rect(61, 80, 6, 22, C_DARK);
+    rect(57, 73, 14, 2, line_a);
+    rect(50, 92, 4, 44, COL_RGB(210, 0, 0));
+    rect(74, 92, 4, 44, COL_RGB(210, 0, 0));
+    rect(38, 10, 52, 2, COL_RGB(182, 0, 0));
+    rect(42, 18, 44, 1, COL_RGB(92, 0, 0));
+}
+
+static void draw_world(uint32_t frame) {
+    uint8_t phase = (uint8_t)((zpos >> 3) & 3U);
+    uint8_t zphase = (uint8_t)((zpos >> 3) & 15U);
+
+    if (hallway_style == 0U) draw_hallway_tech(phase, zphase);
+    else if (hallway_style == 1U) draw_hallway_stone();
+    else draw_hallway_hell();
 
     draw_enemy_sprite(frame);
 
@@ -389,6 +482,7 @@ static void start_game(void) {
     flash_frames = 0;
     hurt_frames = 0;
     last_hold = 0;
+    hallway_style = 0;
     redraw_all = 1;
 }
 
@@ -516,6 +610,9 @@ void app_update(uint32_t frame) {
             if (enemy_hp == 0) {
                 enemy_active = 0;
                 kills++;
+                hallway_style = (uint8_t)((hallway_style + 1U) % HALLWAY_COUNT);
+                if (health <= (uint8_t)(100U - HEALTH_ON_KILL)) health = (uint8_t)(health + HEALTH_ON_KILL);
+                else health = 100U;
                 if ((kills % BOSS_KILLS) == 0) boss_pending = 1;
                 zpos += (enemy_kind == BOSS_KIND) ? 160U : 90U;
                 schedule_enemy_spawn();
