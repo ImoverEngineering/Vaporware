@@ -162,6 +162,111 @@ void clock_boost_48mhz(void) {
     TIM3->CR1 = TIM_CR1_CEN;
 }
 
+void system_enter_stop(void) {
+    /* Enter N32G031 Stop mode; return after button (PA7) falling edge.
+     *
+     * Stop mode: HSI and PLL halt, core draws ~10-20 µA.
+     *   IWDG continues on LSI (~40 kHz) — feeds required before entry;
+     *   timeout ~26 s (PR=6, RLR=4095).  IWDG is NOT fed inside this function.
+     *
+     * Wake source: EXTI7 falling edge (PA7, active-LOW button) in event mode.
+     *   SEV + WFE clears any stale ARM event latch; second WFE enters Stop.
+     *   EXTI_PR is cleared between the two WFEs to drain transients.
+     *
+     * CRITICAL post-wake step: on N32G031, APB1/APB2 peripheral clocks do NOT
+     *   automatically restart after Stop mode exit.  HSI must be explicitly
+     *   re-enabled and TIM3/TIM1 must be restarted before any call to
+     *   delay_ms() or ms_now().  Omitting this causes TIM3 to stay stopped,
+     *   delay_ms() to spin indefinitely (no IWDG feed in inner wait loop),
+     *   and the IWDG to reset the MCU — appearing as a boot loop after sleep.
+     *
+     * Register map (confirmed via factory Ghidra analysis):
+     *   AFIO_EXTICR2 = 0x4001000C  (bits[15:12] = port for EXTI7)
+     *   EXTI_IMR  = 0x40010400   EXTI_EMR  = 0x40010404
+     *   EXTI_RTSR = 0x40010408   EXTI_FTSR = 0x4001040C
+     *   EXTI_PR   = 0x40010414
+     *   PWR_CR    = 0x40007000   (PDDS bit1, LPDS bit0)
+     *   SCR       = 0xE000ED10   (SLEEPDEEP bit2)                            */
+
+    volatile uint32_t *AFIO_EXTICR2 = (volatile uint32_t *)0x4001000CUL;
+    volatile uint32_t *EXTI_IMR     = (volatile uint32_t *)0x40010400UL;
+    volatile uint32_t *EXTI_EMR     = (volatile uint32_t *)0x40010404UL;
+    volatile uint32_t *EXTI_RTSR    = (volatile uint32_t *)0x40010408UL;
+    volatile uint32_t *EXTI_FTSR    = (volatile uint32_t *)0x4001040CUL;
+    volatile uint32_t *EXTI_PR      = (volatile uint32_t *)0x40010414UL;
+    volatile uint32_t *PWR_CR       = (volatile uint32_t *)0x40007000UL;
+    volatile uint32_t *SCR          = (volatile uint32_t *)0xE000ED10UL;
+
+    /* 1. Enable AFIO clock (APB2ENR bit0) and PWR clock (APB1ENR bit28). */
+    RCC->APB2ENR |= RCC_APB2ENR_AFIOEN;
+    RCC->APB1ENR |= (1UL << 28);
+
+    /* 2. Route EXTI7 to GPIOA: AFIO_EXTICR2 bits[15:12] = 0000 (GPIOA). */
+    *AFIO_EXTICR2 &= ~(0xFUL << 12);
+
+    /* 3. EXTI7: event mode (EMR), falling edge, clear stale pending. */
+    *EXTI_IMR  &= ~(1UL << 7);   /* disable interrupt mode */
+    *EXTI_EMR   =  (1UL << 7);   /* event mode only (direct assign, no stale bits) */
+    *EXTI_RTSR &= ~(1UL << 7);   /* no rising-edge */
+    *EXTI_FTSR |=  (1UL << 7);   /* falling-edge trigger */
+    *EXTI_PR    =  (1UL << 7);   /* clear any stale pending (W1C) */
+
+    /* 4. PWR_CR: PDDS=0 (Stop) + LPDS=1 (low-power regulator). */
+    *PWR_CR = (*PWR_CR & ~(1UL << 1)) | (1UL << 0);
+
+    /* 5. SCR SLEEPDEEP (bit2). */
+    *SCR |= (1UL << 2);
+
+    /* 6. SEV + WFE clears the ARM event latch (first WFE returns immediately).
+     *    Second EXTI_PR clear drains any edge that arrived during setup.
+     *    Second WFE enters Stop mode and blocks until EXTI7 fires.           */
+    __asm volatile ("sev");
+    __asm volatile ("wfe");
+    *EXTI_PR = (1UL << 7);
+    __asm volatile ("wfe");
+
+    /* ── Execution resumes here after EXTI7 event (PA7 falling edge) ── */
+
+    /* 7. Clear SLEEPDEEP. */
+    *SCR &= ~(1UL << 2);
+
+    /* 8. Disarm EXTI7 event and clear pending. */
+    *EXTI_EMR &= ~(1UL << 7);
+    *EXTI_PR   =  (1UL << 7);
+
+    /* 9. Re-enable HSI and wait for ready.
+     *    N32G031 Stop mode halts HSI; it does not auto-restart on exit.
+     *    APB1/APB2 clocks derive from HSI, so TIM3/TIM1 remain stopped until
+     *    HSI is explicitly re-enabled here.                                   */
+    RCC->CR |= RCC_CR_HSION;
+    {
+        uint32_t i;
+        for (i = 0; i < 200000UL; i++) {
+            if (RCC->CR & RCC_CR_HSIRDY) break;
+        }
+    }
+
+    /* 10. Restart TIM3 at 8 MHz / (7+1) = 1 MHz → 1 ms tick.
+     *     PSC/ARR registers are reset after Stop mode on N32G031.
+     *     Must be re-written before delay_ms() is safe to call.              */
+    RCC->APB1ENR |= RCC_APB1ENR_TIM3EN;
+    TIM3->CR1 = 0;
+    TIM3->PSC = 7;
+    TIM3->ARR = 999;
+    TIM3->EGR = TIM_EGR_UG;
+    TIM3->SR  = 0;
+    TIM3->CR1 = TIM_CR1_CEN;
+
+    /* 11. Restart TIM1 at 8 MHz / 8000 = 1 kHz for ms_now(). */
+    RCC->APB2ENR |= RCC_APB2ENR_TIM1EN;
+    TIM1->CR1 = 0;
+    TIM1->PSC = 7999;
+    TIM1->ARR = 0xFFFF;
+    TIM1->EGR = TIM_EGR_UG;
+    TIM1->SR  = 0;
+    TIM1->CR1 = TIM_CR1_CEN;
+}
+
 void tim1_init(void) {
     /* Enable TIM1 clock on APB2 (TIM1EN = APB2ENR bit 11) */
     RCC->APB2ENR |= RCC_APB2ENR_TIM1EN;

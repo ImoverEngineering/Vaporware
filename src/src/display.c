@@ -29,14 +29,27 @@ static void spi_write_byte(uint8_t byte) {
     while (SPI1->SR & SPI_SR_BSY);
 }
 
-static void spi_write_byte_queued(uint8_t byte) {
+/* spi_write_byte_fast — TXE-only write for bulk pixel bursts.
+ *
+ * On N32G031, polling BSY after every byte in a large burst deadlocks:
+ * the RX FIFO overflows (OVR) during TXE-only bursts and BSY gets stuck HIGH
+ * after several bytes, spinning forever.  For bulk pixel data we instead poll
+ * only TXE (safe with the SPE toggle done at the start of each fill) and rely
+ * on a 300-cycle fixed drain at the END of each bulk operation to let the last
+ * byte clock out before CS is raised.  This mirrors the approach in
+ * flash_video.c write_frame() which proved stable at 3 MHz SPI.
+ * Single-byte command/data writes (spi_write_byte) keep the BSY poll — those
+ * are sent one at a time with idle time in between, so OVR never accumulates.
+ */
+static inline void spi_write_byte_fast(uint8_t b) {
     while (!(SPI1->SR & SPI_SR_TXE));
-    *(volatile uint8_t *)&SPI1->DR = byte;
+    *(volatile uint8_t *)&SPI1->DR = b;
 }
 
-static void spi_drain_after_burst(void) {
-    for (volatile uint32_t _d = 300u; _d--; );
-}
+/* Drain the SPI shift register after a TXE-only burst.
+ * BSY polling deadlocks on N32G031 post-burst; 300 cycles @ 48 MHz = 6.25 µs
+ * ≥ 2 × byte time at 3 MHz SPI — safe at any PCLK ≤ 48 MHz. */
+#define SPI_DRAIN()  do { for (volatile uint32_t _d = 300u; _d--; ); } while (0)
 
 static void lcd_write_cmd(uint8_t cmd) {
     LCD_DC_CMD();
@@ -48,7 +61,7 @@ static void lcd_write_data(uint8_t data) {
     spi_write_byte(data);
 }
 
-static void display_gpio_init(void) {
+void display_gpio_init(void) {
     RCC->APB2ENR |= RCC_APB2ENR_IOPAEN | RCC_APB2ENR_IOPBEN | RCC_APB2ENR_SPI1EN;
 
     /* Backlight enable — active-LOW output, LOW = on at startup */
@@ -84,15 +97,19 @@ static void display_gpio_init(void) {
     LCD_DC_DATA();
     LCD_RST_HIGH();
 
-    /* PA4, PA5, PA6 — drive LOW.
-     * One of these is the display module power enable (active-LOW).
-     * Without this, the GC9107 receives SPI commands but shows nothing.
-     * Confirmed from slots/flappy firmware disassembly: GPIOA_ODR=0 at boot. */
-    RCC->APB2ENR |= RCC_APB2ENR_IOPAEN;  /* ensure GPIOA clock is on */
-    GPIOA->MODER &= ~((3UL << (4*2)) | (3UL << (5*2)) | (3UL << (6*2)));
-    GPIOA->MODER |=  ((1UL << (4*2)) | (1UL << (5*2)) | (1UL << (6*2))); /* outputs */
+    /* PA4, PA5, PA6 — drive LOW as outputs (display VCC enable).
+     * One or more of these pins gates the display VCC P-FET; driving all LOW
+     * guarantees VCC is on regardless of which specific pin is wired to the gate.
+     * Leaving them floating (input state) may leave the FET off → black screen.
+     *
+     * SAFETY: these pins must ONLY ever be driven LOW from display code.
+     * device_sleep() must NOT drive PA4/5/6 HIGH — PA5 is the coil gate on
+     * at least one board variant and driving it HIGH fires the heating element. */
+    RCC->APB2ENR |= RCC_APB2ENR_IOPAEN;
+    GPIOA->MODER  &= ~((3UL << (4*2)) | (3UL << (5*2)) | (3UL << (6*2)));
+    GPIOA->MODER  |=  ((1UL << (4*2)) | (1UL << (5*2)) | (1UL << (6*2)));
     GPIOA->OTYPER &= ~((1UL << 4) | (1UL << 5) | (1UL << 6));
-    GPIOA->BSRR = (1UL << (4+16)) | (1UL << (5+16)) | (1UL << (6+16)); /* LOW */
+    GPIOA->BSRR    =  (1UL << (4+16)) | (1UL << (5+16)) | (1UL << (6+16)); /* LOW = VCC ON */
 
     /* SPI1: full-duplex master, mode 0, 8-bit, software NSS.
      *
@@ -119,12 +136,99 @@ static void display_gpio_init(void) {
     SPI1->CR2 = 0;
 }
 
+/* display_recover() — extended RST pulse to un-stick the GC9107.
+ *
+ * Used when the GC9107 is stuck in an unknown state (e.g. after flashing new
+ * firmware over a running image, or after a crash mid-SPI-sequence).
+ *
+ * VCC cut via PA4/5/6 has been removed: PA5 is the coil gate on at least one
+ * hardware variant, making it unsafe to drive.  The factory firmware never
+ * touches PA4/5/6.  An extended RST pulse (100 ms low) is sufficient to reset
+ * the GC9107 from any stuck state.
+ */
+void display_recover(void) {
+    display_gpio_init();   /* ensure GPIOs and SPI configured */
+
+    /* Extended RST pulse — 100 ms is long enough to clear any GC9107 stuck state */
+    LCD_RST_LOW();  IWDG_FEED(); delay_ms(100); IWDG_FEED();
+    LCD_RST_HIGH(); IWDG_FEED(); delay_ms(120); IWDG_FEED();
+
+    LCD_CS_LOW();
+    lcd_write_cmd(0x11);
+    IWDG_FEED(); delay_ms(120); IWDG_FEED();
+    lcd_write_cmd(0xFF); lcd_write_data(0xA5);
+    lcd_write_cmd(0x3E); lcd_write_data(0x08);
+    lcd_write_cmd(0x3A); lcd_write_data(0x65);
+    lcd_write_cmd(0x82); lcd_write_data(0x00);
+    lcd_write_cmd(0x98); lcd_write_data(0x00);
+    lcd_write_cmd(0x63); lcd_write_data(0x0F);
+    lcd_write_cmd(0x64); lcd_write_data(0x0F);
+    lcd_write_cmd(0xB4); lcd_write_data(0x34);
+    lcd_write_cmd(0xB5); lcd_write_data(0x30);
+    lcd_write_cmd(0x83); lcd_write_data(0x13);
+    lcd_write_cmd(0x86); lcd_write_data(0x04);
+    lcd_write_cmd(0x87); lcd_write_data(0x19);
+    lcd_write_cmd(0x88); lcd_write_data(0x2F);
+    lcd_write_cmd(0x89); lcd_write_data(0x36);
+    lcd_write_cmd(0x93); lcd_write_data(0x63);
+    lcd_write_cmd(0x96); lcd_write_data(0x81);
+    lcd_write_cmd(0xC3); lcd_write_data(0x10);
+    lcd_write_cmd(0xE6); lcd_write_data(0x00);
+    lcd_write_cmd(0x99); lcd_write_data(0x01);
+    lcd_write_cmd(0x44); lcd_write_data(0x00);
+    lcd_write_cmd(0x70); lcd_write_data(0x07);
+    lcd_write_cmd(0x71); lcd_write_data(0x19);
+    lcd_write_cmd(0x72); lcd_write_data(0x1A);
+    lcd_write_cmd(0x73); lcd_write_data(0x13);
+    lcd_write_cmd(0x74); lcd_write_data(0x19);
+    lcd_write_cmd(0x75); lcd_write_data(0x1D);
+    lcd_write_cmd(0x76); lcd_write_data(0x47);
+    lcd_write_cmd(0x77); lcd_write_data(0x0A);
+    lcd_write_cmd(0x78); lcd_write_data(0x07);
+    lcd_write_cmd(0x79); lcd_write_data(0x47);
+    lcd_write_cmd(0x7A); lcd_write_data(0x05);
+    lcd_write_cmd(0x7B); lcd_write_data(0x09);
+    lcd_write_cmd(0x7C); lcd_write_data(0x0D);
+    lcd_write_cmd(0x7D); lcd_write_data(0x0C);
+    lcd_write_cmd(0x7E); lcd_write_data(0x0C);
+    lcd_write_cmd(0x7F); lcd_write_data(0x08);
+    lcd_write_cmd(0xA0); lcd_write_data(0x0B);
+    lcd_write_cmd(0xA1); lcd_write_data(0x36);
+    lcd_write_cmd(0xA2); lcd_write_data(0x09);
+    lcd_write_cmd(0xA3); lcd_write_data(0x0D);
+    lcd_write_cmd(0xA4); lcd_write_data(0x08);
+    lcd_write_cmd(0xA5); lcd_write_data(0x23);
+    lcd_write_cmd(0xA6); lcd_write_data(0x3B);
+    lcd_write_cmd(0xA7); lcd_write_data(0x04);
+    lcd_write_cmd(0xA8); lcd_write_data(0x07);
+    lcd_write_cmd(0xA9); lcd_write_data(0x38);
+    lcd_write_cmd(0xAA); lcd_write_data(0x0A);
+    lcd_write_cmd(0xAB); lcd_write_data(0x12);
+    lcd_write_cmd(0xAC); lcd_write_data(0x0C);
+    lcd_write_cmd(0xAD); lcd_write_data(0x07);
+    lcd_write_cmd(0xAE); lcd_write_data(0x2F);
+    lcd_write_cmd(0xAF); lcd_write_data(0x07);
+    lcd_write_cmd(0xFF); lcd_write_data(0x00);
+    lcd_write_cmd(0x36); lcd_write_data(0x98);
+    lcd_write_cmd(0x29);
+    delay_ms(10);
+    LCD_CS_HIGH();
+
+    display_fill(0x0000);
+}
+
 void display_init(void) {
     display_gpio_init();
 
+    /* RST sequence matched exactly to OG factory firmware (fw_dump.bin @ 0x8002A54):
+     *   RST HIGH → 10ms → RST LOW → 10ms → RST HIGH → 10ms → CS LOW → 0x11
+     * The factory firmware uses 10ms pulses throughout and sends Sleep Out (0x11)
+     * as the very first SPI command after RST deasserts.  Longer delays (we had
+     * 100ms/120ms) made no difference — the timing above is proven reliable.
+     * Factory firmware never touches PA4/5/6 and has no VCC power cycle. */
     LCD_RST_HIGH(); delay_ms(10);
-    LCD_RST_LOW();  IWDG_FEED(); delay_ms(100); IWDG_FEED();
-    LCD_RST_HIGH(); IWDG_FEED(); delay_ms(120); IWDG_FEED();
+    LCD_RST_LOW();  IWDG_FEED(); delay_ms(10);
+    LCD_RST_HIGH(); delay_ms(10);
 
     /* CS stays LOW for the entire init sequence.
      * The GC9107 state machine requires an uninterrupted SPI session during init
@@ -282,10 +386,11 @@ void display_fill(uint16_t color) {
     for (uint16_t row = 0; row < LCD_HEIGHT; row++) {
         IWDG_FEED();
         for (uint16_t col = 0; col < LCD_WIDTH; col++) {
-            spi_write_byte_queued(hi);
-            spi_write_byte_queued(lo);
+            spi_write_byte_fast(hi);
+            spi_write_byte_fast(lo);
         }
     }
+    SPI_DRAIN();
     *(volatile uint32_t *)0x2000009CUL = 0xEE440000UL;
     spi_drain_after_burst();
     LCD_CS_HIGH();
@@ -301,11 +406,11 @@ void display_fill_rect(uint16_t x, uint16_t y, uint16_t w, uint16_t h, uint16_t 
     for (uint16_t row = 0; row < h; row++) {
         IWDG_FEED();
         for (uint16_t col = 0; col < w; col++) {
-            spi_write_byte_queued(hi);
-            spi_write_byte_queued(lo);
+            spi_write_byte_fast(hi);
+            spi_write_byte_fast(lo);
         }
     }
-    spi_drain_after_burst();
+    SPI_DRAIN();
     LCD_CS_HIGH();
 }
 
@@ -321,12 +426,46 @@ void display_draw_image(const uint16_t *img, uint16_t x, uint16_t y,
         const uint16_t *rowp = img + (uint32_t)row * w;
         for (uint16_t col = 0; col < w; col++) {
             uint16_t px = rowp[col];
-            spi_write_byte_queued((uint8_t)(px >> 8));
-            spi_write_byte_queued((uint8_t)(px & 0xFF));
+            spi_write_byte_fast((uint8_t)(px >> 8));
+            spi_write_byte_fast((uint8_t)(px & 0xFF));
         }
     }
-    spi_drain_after_burst();
+    SPI_DRAIN();
     LCD_CS_HIGH();
+}
+
+void display_draw_sprite(const uint16_t *pixels, uint16_t x, uint16_t y,
+                         uint16_t w, uint16_t h, uint16_t transparent_color) {
+    /* Blit a w×h sprite at (x,y), skipping pixels that match transparent_color.
+     * Each row is scanned for contiguous runs of opaque pixels; each run is sent
+     * as a single display_draw_image call.  This eliminates tearing artifacts
+     * that would occur if transparent pixels were blitted as background color.
+     *
+     * Clipping: only columns within [0, LCD_WIDTH) are sent.  Rows are not
+     * clipped vertically — caller must ensure y+h <= LCD_HEIGHT.
+     *
+     * One IWDG_FEED per row to keep the watchdog happy during large sprites. */
+    for (uint16_t row = 0; row < h; row++) {
+        IWDG_FEED();
+        const uint16_t *rowp = pixels + (uint32_t)row * w;
+        uint16_t col = 0;
+        while (col < w) {
+            /* Skip transparent pixels */
+            while (col < w && rowp[col] == transparent_color) col++;
+            if (col >= w) break;
+            /* Find end of opaque run */
+            uint16_t run_start = col;
+            while (col < w && rowp[col] != transparent_color) col++;
+            /* Clip to display bounds */
+            uint16_t px = x + run_start;
+            uint16_t run_len = col - run_start;
+            if (px >= LCD_WIDTH) continue;
+            if ((uint32_t)px + run_len > LCD_WIDTH) run_len = LCD_WIDTH - px;
+            /* Blit this opaque run */
+            display_draw_image(rowp + run_start, px, (uint16_t)(y + row),
+                               run_len, 1);
+        }
+    }
 }
 
 void display_draw_chunk_2x(const uint16_t *src, uint16_t log_row,
@@ -380,14 +519,27 @@ void display_set_backlight(uint8_t on) {
 }
 
 void display_sleep_in(void) {
-    display_set_backlight(0);
+    /* Backlight is powered by the GC9107's internal charge pump — it turns
+     * off automatically when Sleep In (0x10) stops the oscillator/DC-DC.
+     * Do NOT call display_set_backlight(0) here: driving PB4 HIGH before
+     * the SPI commands land disrupts the GC9107 and prevents Sleep In from
+     * being processed, leaving the screen white and backlight on. */
+
+    /* SPE toggle clears any OVR/TXE deadlock that accumulated during frame
+     * drawing — without it, lcd_write_cmd() can hang in spi_write_byte()
+     * waiting for TXE that never asserts, causing an IWDG reset mid-sleep. */
+    SPI1->CR1 &= ~SPI_CR1_SPE;
+    SPI1->CR1 |=  SPI_CR1_SPE;
     LCD_CS_LOW(); lcd_write_cmd(0x28); LCD_CS_HIGH(); /* Display Off */
     delay_ms(10);
-    LCD_CS_LOW(); lcd_write_cmd(0x10); LCD_CS_HIGH(); /* Sleep In */
+    LCD_CS_LOW(); lcd_write_cmd(0x10); LCD_CS_HIGH(); /* Sleep In → charge pump off → backlight off */
     delay_ms(5);
 }
 
 void display_sleep_out(void) {
+    /* SPE toggle clears OVR state before the post-sleep SPI commands. */
+    SPI1->CR1 &= ~SPI_CR1_SPE;
+    SPI1->CR1 |=  SPI_CR1_SPE;
     LCD_CS_LOW(); lcd_write_cmd(0x11); LCD_CS_HIGH(); /* Sleep Out */
     IWDG_FEED(); delay_ms(120); IWDG_FEED();
     LCD_CS_LOW(); lcd_write_cmd(0x29); LCD_CS_HIGH(); /* Display On */

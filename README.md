@@ -29,8 +29,8 @@ The device runs a Nations Tech **N32G031K8Q7-1** (ARM Cortex-M0) driving a 128×
 | **MCU** | N32G031K8Q7-1, Cortex-M0 @ 8 MHz, 64 KB flash, 8 KB SRAM |
 | **Display** | 128×160 IPS TFT, GC9107, RGB565, SPI @ 4 MHz |
 | **Button** | PA7, active-LOW |
-| **Battery** | 3.7 V LiPo, ~4.2 V full, measured via PB0 ADC |
-| **Coil** | PB0 MOSFET gate — HIGH = fire |
+| **Battery** | 3.7 V LiPo, ~4.2 V full, measured via PA6 ADC (channel 6) |
+| **Coil** | MOSFET gate — HIGH = fire. **Pin varies by board variant** (PB0, PB8, PA5 all observed); scan before use |
 | **Debug** | SWD (PA13/PA14) via ST-Link V2 |
 
 Full pin table and peripheral map: [`docs/README.md`](docs/README.md)
@@ -101,13 +101,14 @@ Look for a line like `1-2   0483:3748  STMicroelectronics ST-Link`. The `build_*
 **5 — Python 3 + pip packages** (for host-side tools and streamer)
 
 ```cmd
-pip install pillow mss numpy pywin32
+pip install pillow mss dxcam numpy pywin32
 ```
 
 | Package | Required for |
 |---|---|
 | `pillow` | All streaming modes (screen, window, video) |
-| `mss` | Fast screen-region capture (`--screen`) |
+| `mss` | Fast screen-region capture (`--screen`) — fallback when dxcam unavailable |
+| `dxcam` | Preferred screen capture — captures GPU-composited/hardware-accelerated video that mss misses |
 | `numpy` | 10× faster BGR565 conversion (optional but recommended) |
 | `pywin32` | Window capture by title (`--window`) |
 
@@ -181,9 +182,9 @@ void app_update(uint32_t frame) {
 | `system` | 8 MHz HSI clock, TIM3 delay, TIM1 wall clock, IWDG feed |
 | `display` | GC9107 init, fill, set window, draw pixel, draw image (RGB565) |
 | `button` | PA7 debounce — pressed / just_pressed / just_released / held_ms |
-| `battery` | PB0 ADC read, raw-to-voltage conversion, charge-level thresholds |
+| `battery` | PA6 ADC read (channel 6), raw-to-voltage conversion, charge-level thresholds |
 | `nv` | Write-forward NV storage in top 4 KB of flash — read / write / reset |
-| `vape` | Coil safety init — holds PB0 LOW at reset to prevent accidental fire |
+| `vape` | Coil safety init — drives coil gate LOW at reset to prevent accidental fire |
 | `app` | `main()`, frame timer, sleep timeout, hold-to-reset, hardware init order |
 
 Full API documentation: [`docs/README.md`](docs/README.md)

@@ -1,19 +1,19 @@
 /* vaporware/src/battery.c — Battery ADC driver for N32G031 vape hardware
  *
- * Hardware: PB0 = battery sense pin, ADC1 channel 8.
+ * Hardware: PA6 = battery sense pin, ADC1 channel 6.
  *   ADC base: 0x40020800 (confirmed on Raz DC25000 via OpenOCD, 2026-04-09).
  *   VDDA: 3.0 V (LDO, not 3.3 V) — all raw-to-voltage conversions use 3.0 V.
+ *   Divider ratio ≈ 0.71 (Vpin = Vbat × 0.71); confirmed by live ADC scan 2026-05-29.
  *
- * Voltage formula (empirical divider ratio ~0.71, not the 1:28 in config.h):
- *   Vbat = raw * 1.41 * 3.0 / 4096
- * Use the threshold constants in config.h directly; do not recompute from DIVIDER.
+ * Voltage formula:  Vbat = raw × 1.41 × 3.0 / 4096
+ * Use the threshold constants in config.h directly (BAT_FULL=3582, WARN=2906, CRIT=2422).
  *
- * bat_init()      — initialises ADC peripheral; does NOT change PB0 GPIO mode.
- * bat_read_raw()  — temporarily switches PB0 to analog, triggers one conversion,
+ * bat_init()      — initialises ADC peripheral; does NOT change PA6 GPIO mode.
+ * bat_read_raw()  — temporarily switches PA6 to analog, triggers one conversion,
  *                   restores the original GPIO mode, and returns the 12-bit result.
  *
  * ADC channel and battery thresholds are configured in config.h:
- *   BAT_ADC_CHANNEL=8, BAT_GPIO_PIN=0 (PB0), VDDA=3.0V, BAT_FULL/WARN/CRIT.
+ *   BAT_ADC_CHANNEL=6, BAT_GPIO_PORT=GPIOA, BAT_GPIO_PIN=6, VDDA=3.0V.
  */
 #include "battery.h"
 #include "config.h"
@@ -34,24 +34,25 @@ void bat_init(void) {
      * the ADC input clock within spec at 8 MHz HSI */
     *(volatile uint32_t *)0x4002102CUL = 0x00003804UL;
 
-    /* Enable GPIOB clock (PB0 is the battery sense pin / ADC channel 8) */
-    RCC->APB2ENR |= RCC_APB2ENR_IOPBEN;
+    /* Enable GPIOA clock (PA6 is the battery sense pin / ADC channel 6) */
+    RCC->APB2ENR |= RCC_APB2ENR_IOPAEN;
 
-    /* NOTE: PB0 GPIO mode is NOT changed to analog here.
-     * bat_read_raw() temporarily switches the pin to MODER=11 (analog/high-Z)
-     * for the duration of the conversion, then restores the saved mode.
-     * This prevents the pin from floating between readings.               */
+    /* NOTE: PA6 GPIO mode is NOT changed to analog here.
+     * bat_read_raw() saves GPIOA->MODER, temporarily switches PA6 to analog
+     * (MODER=11) for the ADC conversion, then restores the saved mode so PA6
+     * returns to output-LOW (display VCC enable).  Keeping PA6 as output-LOW
+     * between readings ensures the display P-FET stays on at all times except
+     * during the brief (~21-84 µs) conversion window.                     */
 
-    /* SMPR2: set bits[26:24]=0b111 for channel 8 → 239.5-cycle sample time.
-     * The long sample time is required because the ~96 kΩ Thevenin resistance
-     * of the battery-sense resistor divider limits the charging current into
-     * the ADC sample capacitor; a short sample time would give low results. */
-    ADC_SMPR2 |= (7UL << 24);  /* ch8 = bits[26:24] = 239.5 cycles */
+    /* SMPR2: set bits[20:18]=0b111 for channel 6 → 239.5-cycle sample time.
+     * The long sample time ensures the ~0.71 divider resistor network fully
+     * charges the ADC sample capacitor before conversion starts.            */
+    ADC_SMPR2 |= (7UL << 18);  /* ch6 = bits[20:18] = 239.5 cycles */
 
     /* RSEQ1: regular sequence length = 0 → 1 conversion */
     ADC_RSEQ1  = 0x00000000UL;
 
-    /* RSEQ3: first (and only) conversion = BAT_ADC_CHANNEL (8 = PB0) */
+    /* RSEQ3: first (and only) conversion = BAT_ADC_CHANNEL (6 = PA6) */
     ADC_RSEQ3  = (uint32_t)BAT_ADC_CHANNEL;
 
     /* CTRL2: ADON (bit0) = 1 → power on ADC */
@@ -63,28 +64,37 @@ void bat_init(void) {
 }
 
 uint16_t bat_read_raw(void) {
-    /* Save GPIOB MODER, then set PB0 (BAT_GPIO_PIN) to analog mode (MODER=11).
+    /* Save GPIOA MODER, then set PA6 (BAT_GPIO_PIN) to analog mode (MODER=11).
      * Analog mode disconnects the digital output driver and Schmitt trigger,
      * which is required for accurate ADC readings — floating digital inputs
-     * can inject noise into the sample. */
-    uint32_t saved_moder = GPIOB->MODER;
-    GPIOB->MODER |= (3UL << (BAT_GPIO_PIN * 2));  /* MODER=11 = analog */
+     * inject noise into the sample.
+     *
+     * PA6 is normally output-LOW (display VCC enable).  The saved MODER
+     * restores output-LOW on exit, so the display P-FET stays on for all but
+     * the ~21-84 µs conversion window.  The 239.5-cycle sample time exceeds
+     * the RC settling time of the battery divider by >100×, so the reading
+     * is accurate even though PA6 was at 0 V immediately before. */
+    uint32_t saved_moder = BAT_GPIO_PORT->MODER;
+    BAT_GPIO_PORT->MODER |= (3UL << (BAT_GPIO_PIN * 2));  /* MODER=11 = analog */
 
-    /* Clear EOC flag, then trigger conversion via SWSTRRCH (CTRL2 bit 22).
-     * SWSTRRCH = Software Start Regular Channel conversion.
-     * The for-loop feeds IWDG while waiting for EOC (bit1 of STS).
-     * 500 iterations at 8MHz is generous; conversion typically completes
-     * in ~30 µs at 239.5-cycle sample time + 12.5 conversion cycles. */
+    /* Trigger conversion via SWSTRRCH (CTRL2 bit 22) and poll EOC (STS bit 1).
+     * At 48 MHz PLL the tight loop below runs at ~10 ns/iter; 20 000 iters =
+     * ~200 µs — ample margin for the longest ADC conversion (239.5 + 12.5
+     * cycles at any supported ADC clock).  IWDG is fed once before and after
+     * rather than inside the loop: each IWDG_FEED() write is a slow peripheral
+     * bus transaction that inflates per-iteration time and defeats the purpose
+     * of counting iterations as a time proxy at PLL speeds. */
+    IWDG_FEED();
     ADC_STS    = 0;
     ADC_CTRL2 |= (1UL << 22);  /* SWSTRRCH: start conversion */
-    for (uint32_t i = 0; i < 500u && !(ADC_STS & 2U); i++)
-        IWDG_FEED();
+    for (uint32_t i = 0; i < 20000u && !(ADC_STS & 2U); i++);
+    IWDG_FEED();
 
     /* Read 12-bit result from data register (bits[11:0]) */
     uint16_t r = (uint16_t)(ADC_DAT & 0xFFFU);
 
-    /* Restore PB0 GPIO mode (may be input, output, or AF depending on caller) */
-    GPIOB->MODER = saved_moder;
+    /* Restore PA6 GPIO mode (may be input, output, or AF depending on caller) */
+    BAT_GPIO_PORT->MODER = saved_moder;
 
     /* raw < 50 (≈ 0.04 V) indicates the ADC timed out, the battery is
      * disconnected, or a hardware fault.  Return BAT_FULL as a safe default

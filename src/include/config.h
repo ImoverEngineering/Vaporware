@@ -45,17 +45,21 @@
  * bat_read_raw() temporarily switches the battery sense pin to analog
  * mode for the ADC conversion, then restores the previous GPIO mode.
  *
- * Thresholds (12-bit, VDDA=3.0V, ~1:28 resistor divider):
- *   Raw 205 ≈ 4.20 V (full)     Raw 181 ≈ 3.70 V (charged)
- *   Raw 146 ≈ 3.00 V (warn)     Raw 122 ≈ 2.50 V (critical)
+ * Hardware (confirmed by OpenOCD live ADC scan, 2026-05-29):
+ *   Battery sense is on PA6 = ADC channel 6, divider ratio ≈ 0.71
+ *   (Vpin = Vbat × 0.71).  PA4/PA5 are irrelevant to display power
+ *   on this board; PA6 must NOT be driven LOW or it corrupts readings.
  *
- * To re-derive thresholds:  raw = Vbat / (divider_ratio * VDDA) * 4096
- * Example: 3.7V / (28 * 3.0V) * 4096 ≈ 181                          */
-#define BAT_ADC_CHANNEL 8       /* ADC channel for battery sense pin    */
-#define BAT_GPIO_PIN    0       /* GPIO pin number for battery sense     */
-#define BAT_FULL        181     /* ≈ 3.70 V — display full indicator     */
-#define BAT_WARN        146     /* ≈ 3.00 V — display low indicator      */
-#define BAT_CRIT        122     /* ≈ 2.50 V — force sleep immediately    */
+ * Thresholds (12-bit, VDDA=3.0V, divider ratio 0.71):
+ *   raw = Vbat × 0.71 × 4096 / 3.0
+ *   Raw 4068 ≈ 4.20 V (max charge)   Raw 3582 ≈ 3.70 V (charged)
+ *   Raw 2906 ≈ 3.00 V (warn)         Raw 2422 ≈ 2.50 V (critical)  */
+#define BAT_ADC_CHANNEL 6       /* ADC channel 6 = PA6                  */
+#define BAT_GPIO_PORT   GPIOA   /* GPIO port for battery sense pin       */
+#define BAT_GPIO_PIN    6       /* GPIO pin number for battery sense     */
+#define BAT_FULL        3582    /* ≈ 3.70 V — display full indicator     */
+#define BAT_WARN        2906    /* ≈ 3.00 V — display low indicator      */
+#define BAT_CRIT        2422    /* ≈ 2.50 V — force sleep immediately    */
 
 /* ── NV flash storage ─────────────────────────────────────────────────
  * 8 keys × 512-byte pages, write-forward within each page.
@@ -66,8 +70,13 @@
 #define NV_NUM_KEYS     8
 
 /* ── App framework ────────────────────────────────────────────────────
- * FRAME_MS controls the target frame period (~30 fps at 33 ms).      */
-#define APP_FRAME_MS    33U
+ * FRAME_MS: target frame period (~30 fps at 33 ms).
+ * BTN_HOLD_WAKE_MS: PA7 must stay LOW continuously for this many ms
+ *   after waking from Stop mode to be accepted as a genuine button press.
+ *   Spurious wakes from board transients last microseconds to low tens of
+ *   ms; real presses last 200 ms+.  Increase if spurious wakes persist.  */
+#define APP_FRAME_MS       33U
+#define BTN_HOLD_WAKE_MS   50U
 
 /* ── SWD debug pins (Cortex-M0 fixed, do not reassign) ───────────────
  * PA13 = SWDIO, PA14 = SWCLK.  Restored during sleep so the debugger
