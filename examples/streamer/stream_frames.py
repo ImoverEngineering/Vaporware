@@ -170,17 +170,12 @@ class VapeDisplay:
     (IDX + BUF + TRIG in a single SWD bulk transfer).
     """
 
-    # Path where the chunk writer sidecar stores the current chunk in WSL's
-    # native /tmp filesystem (tmpfs — instant read by OpenOCD load_image).
-    _WSL_CHUNK_PATH = '/tmp/vape_chunk.bin'
-
     def __init__(self, freq=4000000):
         self._prev_chunks = [None] * NUM_CHUNKS
         self._freq_khz = freq // 1000
         self._sock = None
         self._ocd_proc = None
         self._wsl_keepalive = None  # persistent WSL process; keeps WSL VM alive so usbipd doesn't detach
-        self._wsl_writer = None    # sidecar: receives chunk bytes, writes to WSL /tmp
         self._rxbuf = b''   # persistent receive buffer for telnet stream
         self._connect()
 
@@ -209,34 +204,6 @@ class VapeDisplay:
             stderr=subprocess.DEVNULL,
         )
         time.sleep(0.5)  # brief wait for the keepalive process to settle in WSL
-
-        # Launch WSL chunk-writer sidecar.  Python (Windows) can't write directly
-        # to WSL's native /tmp filesystem; going through /mnt/c/ adds ~50 ms of
-        # cross-filesystem overhead per chunk.  This sidecar reads length-prefixed
-        # chunk bytes from its stdin, writes them to /tmp/vape_chunk.bin (tmpfs,
-        # instant), then prints "ok\n" so the caller knows the file is ready.
-        _sidecar_py = (
-            'import sys,struct\n'
-            'p="/tmp/vape_chunk.bin"\n'
-            'while True:\n'
-            '  hdr=sys.stdin.buffer.read(4)\n'
-            '  if len(hdr)<4: break\n'
-            '  n=struct.unpack("<I",hdr)[0]\n'
-            '  buf=bytearray()\n'
-            '  while len(buf)<n:\n'
-            '    c=sys.stdin.buffer.read(n-len(buf))\n'
-            '    if not c: break\n'
-            '    buf+=c\n'
-            '  if not buf: break\n'
-            '  open(p,"wb").write(bytes(buf))\n'
-            '  sys.stdout.write("ok\\n"); sys.stdout.flush()\n'
-        )
-        self._wsl_writer = subprocess.Popen(
-            ['wsl', '-u', 'root', 'python3', '-c', _sidecar_py],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-        )
 
         # Now attach ST-Link to WSL
         print("  Attaching ST-Link to WSL…")
@@ -292,6 +259,7 @@ class VapeDisplay:
                 log = "(log unavailable)"
             raise RuntimeError(f"OpenOCD exited early (rc={rc}):\n{log}")
         self._sock = socket.create_connection(('localhost', OCD_TELNET_PORT), timeout=5)
+        self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)  # no Nagle buffering
         self._sock.settimeout(15)
         self._read_prompt()   # consume welcome banner + first prompt
 
@@ -364,42 +332,48 @@ class VapeDisplay:
         self._sock.sendall((command + '\n').encode())
         return self._read_prompt()
 
-    def _sidecar_write(self, data):
-        """Write variable-length binary data to the WSL sidecar (length-prefixed)."""
-        self._wsl_writer.stdin.write(struct.pack('<I', len(data)))
-        self._wsl_writer.stdin.write(data)
-        self._wsl_writer.stdin.flush()
-        self._wsl_writer.stdout.readline()   # block until sidecar acks
+    # Set to True to print per-phase timing for each chunk send (debugging).
+    _TIMING = False
 
     def _send_chunk(self, idx, chunk):
-        """Write one chunk to the MCU via a single load_image, then wait for blit.
+        """Write one chunk to the MCU via inline write_memory, then wait for blit.
 
-        Sends [IDX(4)][BUF(N)][TRIG(4)] as a binary file to WSL /tmp via the
-        sidecar, then issues load_image.  TRIG is the last word written, so the
-        MCU cannot fire before BUF is fully in SRAM.
+        Sends IDX(4) + BUF(N) + TRIG(4) as inline hex words in a single
+        write_memory TCL command, combined with the blit-wait poll loop — all
+        in ONE telnet round-trip instead of the previous three (sidecar write,
+        load_image, poll).
 
-        After load_image completes (SWD write done), the MCU begins blitting
-        FAST_BUF to the display over SPI.  We MUST wait for this blit to finish
-        before writing the next chunk, otherwise the next SWD write overwrites
-        FAST_BUF while the MCU is still reading it (race condition → corrupted
-        display and unpredictable half-screen freezes).
+        Eliminates the WSL sidecar subprocess entirely.  The old approach piped
+        chunk bytes through the Windows→WSL process boundary twice (write + ack),
+        which cost ~40ms per chunk.  Inline write_memory goes through the already-
+        open telnet socket (WSL loopback), with no extra IPC overhead.
 
-        The wait uses a TCL while-loop that runs INSIDE OpenOCD (zero extra USB
-        round-trips per poll).  The MCU clears FAST_TRIG to 0 after the blit;
-        the loop returns as soon as that happens.  Cost: ~14ms (blit time) +
-        one telnet round-trip (~3ms).
+        TRIG is the last word in the hex list, so the MCU cannot fire before the
+        full BUF is written — same atomicity guarantee as load_image.
+
+        The TCL poll loop runs inside OpenOCD (no extra USB round-trips per
+        iteration).  The MCU clears FAST_TRIG after the SPI blit; the loop exits
+        immediately.
         """
+        t0 = time.monotonic()
         packet = struct.pack('<I', idx) + chunk + struct.pack('<I', CTRL_CHUNK)
-        self._sidecar_write(packet)
-        self._sock.sendall(
-            f'load_image {self._WSL_CHUNK_PATH} 0x{FAST_IDX_ADDR:08X} bin\n'.encode()
+        words = struct.unpack(f'<{len(packet) // 4}I', packet)
+        hex_words = ' '.join(f'0x{w:08X}' for w in words)
+        t1 = time.monotonic()
+
+        # Single telnet round-trip: write all words then poll until blit done.
+        cmd = (
+            f'write_memory 0x{FAST_IDX_ADDR:08X} 32 {{{hex_words}}}; '
+            f'set _i 0; while {{[lindex [read_memory 0x{FAST_TRIG_ADDR:08X} 32 1] 0] != 0'
+            f' && [incr _i] < 200}} {{}}'
         )
+        self._sock.sendall((cmd + '\n').encode())
+        t2 = time.monotonic()
         self._read_prompt()
-        # Wait for MCU blit to finish before next SWD write touches FAST_BUF.
-        # Blit time = 40 rows × 80 phys rows × 128px × 2B × 8 / 12 MHz ≈ 14ms.
-        # Fixed sleep is simpler and cheaper than polling (each mrw costs ~10ms
-        # of SWD overhead, making a poll loop far slower than a plain sleep).
-        time.sleep(0.025)   # 14ms blit + 11ms margin (Windows timer ~15.6ms grain)
+        t3 = time.monotonic()
+
+        if self._TIMING:
+            print(f'\n  [chunk {idx}] fmt={1000*(t1-t0):.1f}ms  send={1000*(t2-t1):.1f}ms  wait={1000*(t3-t2):.1f}ms  total={1000*(t3-t0):.1f}ms')
 
     def send_frame(self, chunks):
         """Send all changed chunks. Returns (elapsed_seconds, chunks_sent).
@@ -479,12 +453,6 @@ class VapeDisplay:
                 self._ocd_proc.wait(timeout=3)
             except Exception:
                 self._ocd_proc.terminate()
-        if self._wsl_writer:
-            try:
-                self._wsl_writer.stdin.close()
-                self._wsl_writer.wait(timeout=2)
-            except Exception:
-                self._wsl_writer.terminate()
         if self._wsl_keepalive:
             try:
                 self._wsl_keepalive.terminate()
@@ -554,12 +522,15 @@ class VapeDisplayNative(VapeDisplay):
         time.sleep(5.0)
 
     def _send_chunk(self, idx, chunk):
-        """Write chunk via write_memory with inline hex — no file, no sidecar."""
+        """Write chunk via write_memory with inline hex + blit-wait poll."""
         packet = struct.pack('<I', idx) + chunk + struct.pack('<I', CTRL_CHUNK)
-        # 1032 bytes = 258 32-bit LE words
         words = struct.unpack(f'<{len(packet) // 4}I', packet)
         hex_words = ' '.join(f'0x{w:08X}' for w in words)
-        self._cmd(f'write_memory 0x{FAST_IDX_ADDR:08X} 32 {{ {hex_words} }}')
+        self._cmd(
+            f'write_memory 0x{FAST_IDX_ADDR:08X} 32 {{{hex_words}}}; '
+            f'set _i 0; while {{[lindex [read_memory 0x{FAST_TRIG_ADDR:08X} 32 1] 0] != 0'
+            f' && [incr _i] < 200}} {{}}'
+        )
 
     def close(self):
         try:
@@ -885,6 +856,10 @@ def main():
                     help="Use Windows-native OpenOCD (no WSL/sidecar) — faster, ~3-4ms/chunk")
     ap.add_argument("--wsl", action="store_true",
                     help="Force WSL+OpenOCD backend even on Windows (legacy)")
+    ap.add_argument("--crop", nargs=4, type=float, metavar=("L", "T", "R", "B"),
+                    help="Crop fraction of source image (0.0-1.0). E.g. '0.333 0 0.667 1' for center third of width.")
+    ap.add_argument("--rotate", type=int, choices=[90, 180, 270],
+                    help="Rotate image before displaying. Hold vape sideways for 90/270.")
     args = ap.parse_args()
 
     if not HAS_PIL and not args.halt:
@@ -976,6 +951,29 @@ def main():
         if frames is not None:
             # ── PIL-image frame loop (screen / window / video / numpy fallback) ──
             for img in frames:
+                if args.crop:
+                    l, t, r, b = args.crop
+                    iw, ih = img.size
+                    img = img.crop((int(l * iw), int(t * ih), int(r * iw), int(b * ih)))
+                if args.rotate:
+                    # Optimised: crop source to pre-rotation aspect ratio, downscale
+                    # to near-final size (80×64 for 90°/270°), THEN rotate the tiny
+                    # image.  Avoids rotating a multi-megapixel frame every tick.
+                    iw, ih = img.size
+                    pre_w = LCD_H if args.rotate in (90, 270) else LCD_W
+                    pre_h = LCD_W if args.rotate in (90, 270) else LCD_H
+                    src_ratio = iw / ih
+                    pre_ratio = pre_w / pre_h
+                    if src_ratio > pre_ratio + 0.01:
+                        new_w = int(ih * pre_ratio)
+                        x_off = (iw - new_w) // 2
+                        img = img.crop((x_off, 0, x_off + new_w, ih))
+                    elif src_ratio < pre_ratio - 0.01:
+                        new_h = int(iw / pre_ratio)
+                        y_off = (ih - new_h) // 2
+                        img = img.crop((0, y_off, iw, y_off + new_h))
+                    img = img.resize((pre_w, pre_h), Image.LANCZOS)
+                    img = img.rotate(args.rotate, expand=True)  # now only 80×64 pixels
                 chunks = image_to_chunks(img)
                 elapsed, sent = disp.send_frame(chunks)
                 time.sleep(random.uniform(0.0, DITHER_S))
