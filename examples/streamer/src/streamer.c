@@ -17,16 +17,16 @@
  * SRAM layout (one write_memory per chunk):
  *
  *   CTRL      @ 0x20000010  0xDEAD0000 = reset display
- *   FAST_IDX  @ 0x20000100  chunk index 0-4              (4 bytes)
- *   FAST_BUF  @ 0x20000104  logical pixel data 64×40×2 B (5120 bytes)
- *   FAST_TRIG @ 0x20001504  0xCC = chunk ready            (4 bytes) <- written LAST
+ *   FAST_IDX  @ 0x20000100  chunk index 0-3              (4 bytes)
+ *   FAST_BUF  @ 0x20000104  logical pixel data 64×20×2 B (2560 bytes)
+ *   FAST_TRIG @ 0x20000B04  0xCC = chunk ready            (4 bytes) <- written LAST
  *
- * The PC sends a single write_memory of 5128 bytes to 0x20000100.
+ * The PC sends a single load_image of 2568 bytes to 0x20000100.
  * FAST_TRIG is the last word written, so the MCU cannot act before the full
  * chunk is resident in SRAM.
  *
- * 2-chunk mode cuts USB round-trips to 2 per frame vs the old 5-chunk mode,
- * targeting ~30fps and dramatically reducing the rolling-shutter artifact.
+ * 4-chunk mode with 20-row chunks fits load_image in 1-2 Windows timer ticks
+ * (~15-32ms) vs 2-3 ticks for 40-row chunks, improving delta streaming fps.
  */
 
 #include "n32g031.h"
@@ -37,17 +37,17 @@
 /* Protocol SRAM addresses — 2× pixel mode (64×80 logical → 128×160 physical) */
 #define CTRL      ((volatile uint32_t *)0x20000010UL)
 #define FAST_IDX  ((volatile uint32_t *)0x20000100UL)
-#define FAST_BUF  ((const uint16_t    *)0x20000104UL)  /* 64×40×2 = 5120 bytes */
-#define FAST_TRIG ((volatile uint32_t *)0x20001504UL)  /* 0x20000104 + 5120   */
+#define FAST_BUF  ((const uint16_t    *)0x20000104UL)  /* 64×20×2 = 2560 bytes */
+#define FAST_TRIG ((volatile uint32_t *)0x20000B04UL)  /* 0x20000104 + 2560   */
 
 #define CTRL_IDLE  0x00000000UL
 #define CTRL_CHUNK 0x000000CCUL
 #define CTRL_RESET 0xDEAD0000UL
 #define CTRL_SLEEP 0xDEAD0001UL
 
-#define CHUNK_ROWS 40u  /* logical rows per chunk (80 physical rows after 2× scale) */
+#define CHUNK_ROWS 20u  /* logical rows per chunk (40 physical rows after 2× scale) */
 #define CHUNK_W    64u  /* logical width (128 physical pixels after 2× scale) */
-#define NUM_CHUNKS 2u
+#define NUM_CHUNKS 4u
 
 /* Crash-location sentinels — written before each operation.
  * Read via: openocd -f n32g031.openocd.cfg -c 'init;halt;mdw 0x20000060 4;resume;exit'

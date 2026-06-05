@@ -21,14 +21,16 @@ Usage examples:
     python stream_frames.py --halt
 
 Protocol (see streamer.c for MCU side):
-    Fast streaming layout — one write_memory per chunk:
+    4-chunk mode: 64×20 logical px per chunk → 128×40 physical px after 2× scale.
 
-    FAST_IDX  @ 0x20000100   chunk index 0–9
-    FAST_BUF  @ 0x20000104   1024 bytes of logical pixel data (64×8 px, BGR565 LE)
-    FAST_TRIG @ 0x20000504   0xCC written LAST — MCU blits chunk, clears to 0
+    FAST_IDX  @ 0x20000100   chunk index 0–3              (4 bytes)
+    FAST_BUF  @ 0x20000104   64×20×2 = 2560 bytes logical pixel data (BGR565 LE)
+    FAST_TRIG @ 0x20000B04   0xCC written LAST — MCU blits chunk, clears to 0
 
-    OpenOCD load_image /tmp/vape_chunk.bin 0x20000100 bin
-    FAST_TRIG is the final word — MCU cannot fire before BUF is fully written.
+    PC sends 2568-byte binary via WSL sidecar + OpenOCD load_image.
+    TRIG is the last word — MCU cannot act before BUF is fully in SRAM.
+    ~20ms load_image + 9ms blit sleep = ~29ms/chunk → ~32fps single-chunk,
+    ~8fps all-4-chunks video.
 
     Legacy CTRL @ 0x20000010:
         0xDEAD0000 = reset display
@@ -78,8 +80,8 @@ except Exception:
 # At ~150 KB/s effective hla_swd throughput: ~7ms SWD + ~11ms SPI = ~18ms/chunk
 # → ~6fps for full-frame updates vs ~3fps in full-resolution mode.
 FAST_IDX_ADDR  = 0x20000100
-FAST_BUF_ADDR  = 0x20000104   # IDX(4) + 5120 bytes logical pixel data (64×40×2)
-FAST_TRIG_ADDR = 0x20001504   # IDX(4) + BUF(5120) bytes past FAST_IDX_ADDR
+FAST_BUF_ADDR  = 0x20000104   # IDX(4) + 2560 bytes logical pixel data (64×20×2)
+FAST_TRIG_ADDR = 0x20000B04   # IDX(4) + BUF(2560) bytes past FAST_IDX_ADDR
 CTRL_ADDR      = 0x20000010   # legacy: reset / sleep
 
 _STREAMER_DIR  = os.path.dirname(os.path.abspath(__file__))
@@ -89,10 +91,11 @@ CTRL_CHUNK = 0x000000CC
 CTRL_RESET = 0xDEAD0000
 CTRL_SLEEP = 0xDEAD0001
 
-# 2-chunk mode: 40 logical rows per chunk (80 physical rows after 2× scale).
-# 2 USB round-trips per frame instead of 5 → ~2.5× fps improvement (~30fps).
-CHUNK_ROWS = 40
-NUM_CHUNKS = 2
+# 4-chunk mode: 20 logical rows per chunk (40 physical rows after 2× scale).
+# Smaller chunks fit load_image in 1-2 Windows timer ticks (15-32ms) vs 2-3
+# ticks for 40-row chunks, improving delta streaming fps for partial updates.
+CHUNK_ROWS = 20
+NUM_CHUNKS = 4
 LCD_W, LCD_H = 64, 80   # logical resolution (displayed as 128×160 via 2× scale)
 
 # ── OpenOCD / WSL config ──────────────────────────────────────────────────────
@@ -166,9 +169,15 @@ class VapeDisplay:
       3. Connect to OpenOCD telnet server on localhost:4444.
       4. Resume target — firmware runs through display_init() (~700 ms).
 
-    Each send_frame() call writes one write_memory block per changed chunk
-    (IDX + BUF + TRIG in a single SWD bulk transfer).
+    Each send_frame() call sends one binary chunk via load_image (1 round-trip).
+    The real-time chunk is written to WSL /tmp via a sidecar process; OpenOCD
+    reads the binary file and writes it to SRAM over SWD.  No halt/resume
+    needed — MCU polls FAST_TRIG and fires when TRIG=0xCC appears in SRAM.
     """
+
+    # Path where the chunk writer sidecar stores the current chunk in WSL's
+    # native /tmp filesystem (tmpfs — instant read by OpenOCD load_image).
+    _WSL_CHUNK_PATH = '/tmp/vape_chunk.bin'
 
     def __init__(self, freq=4000000):
         self._prev_chunks = [None] * NUM_CHUNKS
@@ -176,6 +185,7 @@ class VapeDisplay:
         self._sock = None
         self._ocd_proc = None
         self._wsl_keepalive = None  # persistent WSL process; keeps WSL VM alive so usbipd doesn't detach
+        self._wsl_writer = None    # sidecar: receives chunk bytes, writes to WSL /tmp
         self._rxbuf = b''   # persistent receive buffer for telnet stream
         self._connect()
 
@@ -204,6 +214,34 @@ class VapeDisplay:
             stderr=subprocess.DEVNULL,
         )
         time.sleep(0.5)  # brief wait for the keepalive process to settle in WSL
+
+        # Launch WSL chunk-writer sidecar.  Python (Windows) can't write directly
+        # to WSL's native /tmp filesystem; going through /mnt/c/ adds ~50 ms of
+        # cross-filesystem overhead per chunk.  This sidecar reads length-prefixed
+        # chunk bytes from its stdin, writes them to /tmp/vape_chunk.bin (tmpfs,
+        # instant), then prints "ok\n" so the caller knows the file is ready.
+        _sidecar_py = (
+            'import sys,struct\n'
+            'p="/tmp/vape_chunk.bin"\n'
+            'while True:\n'
+            '  hdr=sys.stdin.buffer.read(4)\n'
+            '  if len(hdr)<4: break\n'
+            '  n=struct.unpack("<I",hdr)[0]\n'
+            '  buf=bytearray()\n'
+            '  while len(buf)<n:\n'
+            '    c=sys.stdin.buffer.read(n-len(buf))\n'
+            '    if not c: break\n'
+            '    buf+=c\n'
+            '  if not buf: break\n'
+            '  open(p,"wb").write(bytes(buf))\n'
+            '  sys.stdout.write("ok\\n"); sys.stdout.flush()\n'
+        )
+        self._wsl_writer = subprocess.Popen(
+            ['wsl', '-u', 'root', 'python3', '-c', _sidecar_py],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
 
         # Now attach ST-Link to WSL
         print("  Attaching ST-Link to WSL…")
@@ -291,6 +329,18 @@ class VapeDisplay:
         self._sock.settimeout(15)
         self._cmd('echo synced')   # re-sync: guarantees next _read_prompt waits for a fresh prompt
 
+        # Force display re-init regardless of whether reset_halt actually reset
+        # the MCU.  If reset_halt succeeded the MCU just finished draw_waiting
+        # and entered the streaming loop — CTRL_RESET runs display_init +
+        # draw_waiting a second time (harmless, leaves display in known state).
+        # If reset_halt failed the MCU is stuck in a stale streaming loop with
+        # a frozen display — CTRL_RESET is the only way to refresh it without
+        # a power cycle.
+        # Do NOT send CTRL_RESET here.  The firmware already ran display_init()
+        # during boot at 8 MHz (correct timing).  CTRL_RESET would re-run init
+        # at 48 MHz PLL where delay_ms() is 6× too short (TIM3 PSC tuned for
+        # 8 MHz), so the GC9107 never gets its 120 ms SLPOUT wait → white screen.
+
     def _read_prompt(self, timeout=5.0):
         """Consume exactly one OpenOCD '>' prompt from the receive stream.
 
@@ -332,48 +382,63 @@ class VapeDisplay:
         self._sock.sendall((command + '\n').encode())
         return self._read_prompt()
 
+    def _sidecar_write(self, data):
+        """Write variable-length binary data to the WSL sidecar (length-prefixed)."""
+        self._wsl_writer.stdin.write(struct.pack('<I', len(data)))
+        self._wsl_writer.stdin.write(data)
+        self._wsl_writer.stdin.flush()
+        self._wsl_writer.stdout.readline()   # block until sidecar acks
+
     # Set to True to print per-phase timing for each chunk send (debugging).
     _TIMING = False
 
     def _send_chunk(self, idx, chunk):
-        """Write one chunk to the MCU via inline write_memory, then wait for blit.
+        """Write one chunk to the MCU via a single load_image, then wait for blit.
 
-        Sends IDX(4) + BUF(N) + TRIG(4) as inline hex words in a single
-        write_memory TCL command, combined with the blit-wait poll loop — all
-        in ONE telnet round-trip instead of the previous three (sidecar write,
-        load_image, poll).
+        Sends [IDX(4)][BUF(N)][TRIG(4)] as a binary file to WSL /tmp via the
+        sidecar, then issues load_image.  TRIG is the last word written, so the
+        MCU cannot fire before BUF is fully in SRAM.
 
-        Eliminates the WSL sidecar subprocess entirely.  The old approach piped
-        chunk bytes through the Windows→WSL process boundary twice (write + ack),
-        which cost ~40ms per chunk.  Inline write_memory goes through the already-
-        open telnet socket (WSL loopback), with no extra IPC overhead.
+        After load_image completes (SWD write done), the MCU begins blitting
+        FAST_BUF to the display over SPI.  We MUST wait for this blit to finish
+        before writing the next chunk, otherwise the next SWD write overwrites
+        FAST_BUF while the MCU is still reading it (race condition).
 
-        TRIG is the last word in the hex list, so the MCU cannot fire before the
-        full BUF is written — same atomicity guarantee as load_image.
-
-        The TCL poll loop runs inside OpenOCD (no extra USB round-trips per
-        iteration).  The MCU clears FAST_TRIG after the SPI blit; the loop exits
-        immediately.
+        Cost: sidecar write (~1ms) + load_image SWD transfer (~20ms at 8MHz) +
+              1 telnet round-trip + 9ms blit sleep ≈ 30ms per chunk → ~33fps
+              for single-chunk updates, ~8fps for all-4-chunks video.
         """
         t0 = time.monotonic()
+
+        # Build binary packet: IDX(4) + BUF(2560) + TRIG(4) = 2568 bytes.
+        # TRIG is the last word -- MCU cannot act before BUF is fully in SRAM.
         packet = struct.pack('<I', idx) + chunk + struct.pack('<I', CTRL_CHUNK)
-        words = struct.unpack(f'<{len(packet) // 4}I', packet)
-        hex_words = ' '.join(f'0x{w:08X}' for w in words)
+
         t1 = time.monotonic()
 
-        # Single telnet round-trip: write all words then poll until blit done.
-        cmd = (
-            f'write_memory 0x{FAST_IDX_ADDR:08X} 32 {{{hex_words}}}; '
-            f'set _i 0; while {{[lindex [read_memory 0x{FAST_TRIG_ADDR:08X} 32 1] 0] != 0'
-            f' && [incr _i] < 200}} {{}}'
-        )
-        self._sock.sendall((cmd + '\n').encode())
+        # Write binary to WSL /tmp via sidecar (avoids slow /mnt/c/ cross-fs)
+        self._sidecar_write(packet)
         t2 = time.monotonic()
+
+        # Single load_image command: binary file → SRAM, one SWD bulk transfer.
+        # No halt/resume needed -- MCU polls FAST_TRIG and fires on 0xCC.
+        self._sock.sendall(
+            f'load_image {self._WSL_CHUNK_PATH} 0x{FAST_IDX_ADDR:08X} bin\n'.encode()
+        )
         self._read_prompt()
         t3 = time.monotonic()
 
+        # Wait for MCU blit to finish before next load_image touches FAST_BUF.
+        # Blit time: 64x20 logical px x 4 bytes/px / 1.5 MB/s = 6.83 ms.
+        # timeBeginPeriod(1) in main() gives ~1ms sleep precision.
+        # 9ms = 6.83ms blit + 2.17ms margin.
+        time.sleep(0.009)
+
         if self._TIMING:
-            print(f'\n  [chunk {idx}] fmt={1000*(t1-t0):.1f}ms  send={1000*(t2-t1):.1f}ms  wait={1000*(t3-t2):.1f}ms  total={1000*(t3-t0):.1f}ms')
+            t4 = time.monotonic()
+            print(f'\n  [chunk {idx}] fmt={1000*(t1-t0):.1f}ms  side={1000*(t2-t1):.1f}ms  '
+                  f'wait={1000*(t3-t2):.1f}ms  sleep=9.0ms  '
+                  f'total={1000*(t4-t0):.1f}ms')
 
     def send_frame(self, chunks):
         """Send all changed chunks. Returns (elapsed_seconds, chunks_sent).
@@ -453,6 +518,12 @@ class VapeDisplay:
                 self._ocd_proc.wait(timeout=3)
             except Exception:
                 self._ocd_proc.terminate()
+        if self._wsl_writer:
+            try:
+                self._wsl_writer.stdin.close()
+                self._wsl_writer.terminate()
+            except Exception:
+                pass
         if self._wsl_keepalive:
             try:
                 self._wsl_keepalive.terminate()
@@ -478,29 +549,41 @@ class VapeDisplayNative(VapeDisplay):
     """
 
     def _connect(self):
+        # Kill any stale WSL processes that might hold the ST-Link via usbipd.
+        # A previous WSL session's keepalive (sleep infinity) keeps WSL alive
+        # and the device attached; pkill it before detaching.
+        subprocess.run(
+            ['wsl', '-u', 'root', '--', 'pkill', '-9', '-f', 'sleep infinity'],
+            capture_output=True, timeout=5
+        )
+        time.sleep(0.3)
+
         # Detach ST-Link from WSL so Windows can claim it
         print("  Detaching ST-Link from WSL (if attached)…")
         subprocess.run(
             ['usbipd', 'detach', '--busid', USBIPD_BUSID],
             capture_output=True,
         )
-        time.sleep(0.5)
+        # Give Windows time to reclaim the USB device (WinUSB re-enumerate).
+        time.sleep(2.0)
 
         # Kill any stale Windows OpenOCD
         subprocess.run(['taskkill', '/F', '/IM', 'openocd.exe'],
                        capture_output=True)
         time.sleep(0.3)
 
-        # Launch Windows-native OpenOCD
+        # Launch Windows-native OpenOCD, capturing stderr to a temp log.
         print("  Starting Windows OpenOCD…")
+        import tempfile
+        self._ocd_log = open(os.path.join(tempfile.gettempdir(), 'openocd_native.log'), 'w')
         self._ocd_proc = subprocess.Popen(
             [OCD_WIN_EXE,
              '-f', OCD_WIN_CFG,
              '-c', 'init',
              '-c', 'reset halt'],
             stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=self._ocd_log,
+            stderr=self._ocd_log,
         )
         # No WSL/usbipd needed — OpenOCD talks to ST-Link directly over WinUSB.
         # 4s covers init + reset halt on native Windows (no virtualisation).
@@ -509,9 +592,17 @@ class VapeDisplayNative(VapeDisplay):
         print("  Connecting to OpenOCD telnet…")
         rc = self._ocd_proc.poll()
         if rc is not None:
-            raise RuntimeError(f"Windows OpenOCD exited early (rc={rc}). "
-                               "Check ST-Link connection and drivers.")
+            self._ocd_log.flush()
+            try:
+                log = open(self._ocd_log.name).read()[-2000:]
+            except Exception:
+                log = "(log unavailable)"
+            raise RuntimeError(
+                f"Windows OpenOCD exited early (rc={rc}).\n"
+                f"Log tail:\n{log}"
+            )
         self._sock = socket.create_connection(('localhost', OCD_TELNET_PORT), timeout=5)
+        self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self._sock.settimeout(15)
         self._read_prompt()
 
@@ -521,16 +612,18 @@ class VapeDisplayNative(VapeDisplay):
         self._cmd('resume')
         time.sleep(5.0)
 
-    def _send_chunk(self, idx, chunk):
-        """Write chunk via write_memory with inline hex + blit-wait poll."""
-        packet = struct.pack('<I', idx) + chunk + struct.pack('<I', CTRL_CHUNK)
-        words = struct.unpack(f'<{len(packet) // 4}I', packet)
-        hex_words = ' '.join(f'0x{w:08X}' for w in words)
-        self._cmd(
-            f'write_memory 0x{FAST_IDX_ADDR:08X} 32 {{{hex_words}}}; '
-            f'set _i 0; while {{[lindex [read_memory 0x{FAST_TRIG_ADDR:08X} 32 1] 0] != 0'
-            f' && [incr _i] < 200}} {{}}'
-        )
+        # Drain stale telnet noise from boot (PLL glitch causes error lines).
+        self._sock.settimeout(0.1)
+        try:
+            while self._sock.recv(4096):
+                pass
+        except socket.timeout:
+            pass
+        self._rxbuf = b''
+        self._sock.settimeout(15)
+        self._cmd('echo synced')
+
+        # Do NOT send CTRL_RESET — display already initialized at 8 MHz during boot.
 
     def close(self):
         try:
