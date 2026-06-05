@@ -835,6 +835,20 @@ def video_frames(path):
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 def main():
+    # Reduce Windows scheduler quantum from 15.6ms → 1ms for the lifetime of
+    # this process.  WSL2 delivers TCP packets to Windows on the scheduler
+    # quantum boundary; without this, OpenOCD's telnet response arrives 0–15.6ms
+    # late per round-trip, quantizing all chunk timings to 15.6ms steps (47ms,
+    # 62ms, 78ms …) even when actual SWD+blit work is ~47ms.  With 1ms quantum
+    # the staircase collapses: every chunk lands at its actual execution time.
+    _timer_boosted = False
+    try:
+        import ctypes
+        ctypes.windll.winmm.timeBeginPeriod(1)
+        _timer_boosted = True
+    except Exception:
+        pass  # Linux / non-Windows: no-op
+
     ap = argparse.ArgumentParser(description="Stream frames to vape display via SWD")
     mode = ap.add_mutually_exclusive_group(required=True)
     mode.add_argument("--test",   action="store_true",
@@ -851,7 +865,7 @@ def main():
                       help="Turn off the LCD and halt the MCU")
 
     ap.add_argument("--freq", type=int, default=8000000,
-                    help="SWD frequency Hz (default 8000000; fall back to 4000000 if unstable)")
+                    help="SWD frequency Hz (default 8000000; 12MHz unstable on N32G031 hla_swd)")
     ap.add_argument("--native", action="store_true",
                     help="Use Windows-native OpenOCD (no WSL/sidecar) — faster, ~3-4ms/chunk")
     ap.add_argument("--wsl", action="store_true",
@@ -983,6 +997,11 @@ def main():
         print("\nStopped.")
     finally:
         disp.close()
+        if _timer_boosted:
+            try:
+                ctypes.windll.winmm.timeEndPeriod(1)
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":
