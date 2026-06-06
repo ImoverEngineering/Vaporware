@@ -114,8 +114,18 @@ OCD_TELNET_PORT = 4444
 
 
 # ── Color conversion ──────────────────────────────────────────────────────────
-def image_to_chunks(img):
-    """Convert any PIL Image → 10 raw chunk byte-strings (4096 B each, BGR565 LE).
+def image_to_chunks(img, posterize=0, smooth_state=None, smooth_alpha=0.0):
+    """Convert a PIL Image → NUM_CHUNKS raw BGR565 byte-strings.
+
+    posterize: drop this many LSBs from each 8-bit RGB channel before packing.
+               Fewer unique color values → more chunk cache hits → better delta
+               compression for noisy/video-compressed content.
+               0 = full BGR565, 2 = recommended for video, 4 = heavy.
+
+    smooth_state: mutable dict {'arr': float32 array} for temporal blending.
+                  Caller owns the dict; pass the same dict every call.
+    smooth_alpha: blend weight of the PREVIOUS frame (0.0 = off, 0.3 = light).
+                  current_out = (1 - alpha)*current + alpha*prev
 
     Uses numpy for fast vectorised BGR565 packing when available (~10× faster
     than the pure-Python fallback).  The fallback is kept for environments
@@ -127,7 +137,24 @@ def image_to_chunks(img):
 
     if HAS_NUMPY:
         # Shape: (LCD_H, LCD_W, 3) — dtype uint8
-        arr = np.frombuffer(img.tobytes(), dtype=np.uint8).reshape(LCD_H, LCD_W, 3)
+        arr = np.frombuffer(img.tobytes(), dtype=np.uint8).reshape(LCD_H, LCD_W, 3).copy()
+
+        # ── Temporal blending ──────────────────────────────────────────────
+        if smooth_alpha > 0.0 and smooth_state is not None:
+            arr_f = arr.astype(np.float32)
+            if 'arr' in smooth_state:
+                arr_f = (1.0 - smooth_alpha) * arr_f + smooth_alpha * smooth_state['arr']
+            smooth_state['arr'] = arr_f
+            arr = np.clip(arr_f, 0, 255).astype(np.uint8)
+
+        # ── Posterization ──────────────────────────────────────────────────
+        # Zero the low BITS of each channel: small color variations (video
+        # compression artifacts, noise) collapse to the same value, so
+        # more chunks compare equal across frames → better delta skipping.
+        if posterize > 0:
+            mask = np.uint8(0xFF & ~((1 << posterize) - 1))
+            arr = arr & mask
+
         r = arr[:, :, 0].astype(np.uint16)
         g = arr[:, :, 1].astype(np.uint16)
         b = arr[:, :, 2].astype(np.uint16)
@@ -802,7 +829,7 @@ def test_chunk_gen():
     return gen
 
 
-def screen_frames(bbox):
+def screen_frames(bbox, posterize=0, smooth_alpha=0.0):
     x, y, w, h = bbox
     if HAS_DXCAM:
         # dxcam uses DXGI Desktop Duplication — captures GPU-composited frames
@@ -828,12 +855,16 @@ def screen_frames(bbox):
         _stop = threading.Event()
 
         def _grab_worker():
+            _smooth_state = {}
             with mss.MSS() as _sct:
                 region = {"left": x, "top": y, "width": w, "height": h}
                 while not _stop.is_set():
                     shot = _sct.grab(region)
                     img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
-                    chunks = image_to_chunks(img)
+                    chunks = image_to_chunks(img,
+                                            posterize=posterize,
+                                            smooth_state=_smooth_state,
+                                            smooth_alpha=smooth_alpha)
                     try:
                         _q.get_nowait()   # discard stale frame if main is slow
                     except queue.Empty:
@@ -1007,6 +1038,15 @@ def main():
                     help="Crop fraction of source image (0.0-1.0). E.g. '0.333 0 0.667 1' for center third of width.")
     ap.add_argument("--rotate", type=int, choices=[90, 180, 270],
                     help="Rotate image before displaying. Hold vape sideways for 90/270.")
+    ap.add_argument("--posterize", type=int, default=0, metavar="BITS",
+                    help="Drop low BITS from each RGB channel before delta compare (1-4). "
+                         "Reduces unique colors so more chunks match between frames → better "
+                         "delta compression for noisy/compressed video. 0=off (default), "
+                         "2=recommended for video, 4=heavy posterization.")
+    ap.add_argument("--smooth", type=float, default=0.0, metavar="ALPHA",
+                    help="Temporal blend: mix ALPHA of previous frame into current (0.0-0.9). "
+                         "0=off (default). 0.3 smooths apparent motion at low fps; "
+                         "0.5 gives a ghosting/blur effect; >0.7 is very laggy.")
     args = ap.parse_args()
 
     if not HAS_PIL and not args.halt:
@@ -1046,7 +1086,13 @@ def main():
             else:
                 bbox = (0, 0, 1920, 1080)
         print(f"  Screen capture region: {bbox}")
-        frames = screen_frames(bbox)
+        if args.posterize:
+            print(f"  Posterize: {args.posterize} bits dropped per channel")
+        if args.smooth > 0:
+            print(f"  Temporal smooth: alpha={args.smooth:.2f} ({args.smooth*100:.0f}% prev frame)")
+        frames = screen_frames(bbox,
+                               posterize=args.posterize,
+                               smooth_alpha=args.smooth)
     elif args.window:
         frames = window_frames(args.window)
     elif args.file:
@@ -1099,6 +1145,7 @@ def main():
             # ── Frame loop (screen / window / video / numpy fallback) ──
             # screen_frames (mss path) yields pre-converted chunk lists;
             # all other generators yield PIL Images that need conversion here.
+            _smooth_state = {}   # mutable state for temporal blending (non-mss paths)
             for frame in frames:
                 tg0 = time.monotonic()
                 if isinstance(frame, list):
@@ -1129,7 +1176,10 @@ def main():
                             img = img.crop((0, y_off, iw, y_off + new_h))
                         img = img.resize((pre_w, pre_h), Image.BILINEAR)
                         img = img.rotate(args.rotate, expand=True)  # now only 80×64 pixels
-                    chunks = image_to_chunks(img)
+                    chunks = image_to_chunks(img,
+                                            posterize=args.posterize,
+                                            smooth_state=_smooth_state,
+                                            smooth_alpha=args.smooth)
                 tg1 = time.monotonic()
                 elapsed, sent = disp.send_frame(chunks)
                 time.sleep(random.uniform(0.0, DITHER_S))
