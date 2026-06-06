@@ -52,6 +52,36 @@ jobs:
           $OBJCOPY -O ihex   build/flappy.elf build/flappy.hex
           arm-none-eabi-size build/flappy.elf
 
+      - name: Package FlappyVape release
+        working-directory: examples/flappy
+        run: |
+          python3 gen_direct_flash.py
+          mkdir -p release/flappyvape
+          cp build/flappy.bin build/flappy.hex direct_flash.tcl n32g031.openocd.cfg release/flappyvape/
+          cat > release/flappyvape/flash.bat << 'BATEOF'
+          @echo off
+          cd /d "%~dp0"
+          echo.
+          echo  ========================================
+          echo   FlappyVape Flasher
+          echo  ========================================
+          echo.
+          echo  [1/3] Waking WSL...
+          wsl echo ready >nul 2>&1
+          echo  [2/3] Attaching ST-Link to WSL...
+          usbipd attach --wsl --busid 1-2 >nul 2>&1
+          ping -n 3 127.0.0.1 >nul
+          echo  [3/3] Flashing firmware...
+          wsl openocd -f n32g031.openocd.cfg -c "tcl_port disabled; telnet_port disabled; gdb_port disabled" -c "init" -c "source direct_flash.tcl" -c "exit" 2>&1
+          echo.
+          echo  ========================================
+          echo   Done! Unplug the ST-Link and enjoy.
+          echo  ========================================
+          echo.
+          pause
+          BATEOF
+          cd release && zip -r ../../build/flappyvape-release.zip flappyvape/
+
       # ── Vaporslots ─────────────────────────────────────────────────────────
       - name: Build Vaporslots
         working-directory: examples/slots
@@ -84,6 +114,36 @@ jobs:
           $OBJCOPY -O ihex   build/slots.elf build/slots.hex
           arm-none-eabi-size build/slots.elf
 
+      - name: Package Vaporslots release
+        working-directory: examples/slots
+        run: |
+          python3 gen_direct_flash.py
+          mkdir -p release/vaporslots
+          cp build/slots.bin build/slots.hex direct_flash.tcl n32g031.openocd.cfg release/vaporslots/
+          cat > release/vaporslots/flash.bat << 'BATEOF'
+          @echo off
+          cd /d "%~dp0"
+          echo.
+          echo  ========================================
+          echo   Vaporslots Flasher
+          echo  ========================================
+          echo.
+          echo  [1/3] Waking WSL...
+          wsl echo ready >nul 2>&1
+          echo  [2/3] Attaching ST-Link to WSL...
+          usbipd attach --wsl --busid 1-2 >nul 2>&1
+          ping -n 3 127.0.0.1 >nul
+          echo  [3/3] Flashing firmware...
+          wsl openocd -f n32g031.openocd.cfg -c "tcl_port disabled; telnet_port disabled; gdb_port disabled" -c "init" -c "source direct_flash.tcl" -c "exit" 2>&1
+          echo.
+          echo  ========================================
+          echo   Done! Unplug the ST-Link and enjoy.
+          echo  ========================================
+          echo.
+          pause
+          BATEOF
+          cd release && zip -r ../../build/vaporslots-release.zip vaporslots/
+
       # ── Streamer ───────────────────────────────────────────────────────────
       - name: Build Streamer
         working-directory: examples/streamer
@@ -110,18 +170,47 @@ jobs:
           $OBJCOPY -O ihex   build/streamer.elf build/streamer.hex
           arm-none-eabi-size build/streamer.elf
 
+      - name: Package Streamer release
+        working-directory: examples/streamer
+        run: |
+          python3 gen_direct_flash.py
+          mkdir -p release/streamer
+          cp build/streamer.bin build/streamer.hex direct_flash.tcl n32g031.openocd.cfg \
+             stream_frames.py release/streamer/
+          cat > release/streamer/flash.bat << 'BATEOF'
+          @echo off
+          cd /d "%~dp0"
+          echo.
+          echo  ========================================
+          echo   Streamer Flasher
+          echo  ========================================
+          echo.
+          echo  [1/3] Waking WSL...
+          wsl echo ready >nul 2>&1
+          echo  [2/3] Attaching ST-Link to WSL...
+          usbipd attach --wsl --busid 1-2 >nul 2>&1
+          ping -n 3 127.0.0.1 >nul
+          echo  [3/3] Flashing firmware...
+          wsl openocd -f n32g031.openocd.cfg -c "tcl_port disabled; telnet_port disabled; gdb_port disabled" -c "init" -c "source direct_flash.tcl" -c "exit" 2>&1
+          echo.
+          echo  ========================================
+          echo   Done! Run stream_frames.py to start streaming.
+          echo   See README.md for usage.
+          echo  ========================================
+          echo.
+          pause
+          BATEOF
+          cd release && zip -r ../../build/streamer-release.zip streamer/
+
       # ── Upload build artifacts (every run) ────────────────────────────────
       - name: Upload firmware artifacts
         uses: actions/upload-artifact@v4
         with:
           name: vaporware-firmware
           path: |
-            examples/flappy/build/flappy.bin
-            examples/flappy/build/flappy.hex
-            examples/slots/build/slots.bin
-            examples/slots/build/slots.hex
-            examples/streamer/build/streamer.bin
-            examples/streamer/build/streamer.hex
+            examples/flappy/build/flappyvape-release.zip
+            examples/slots/build/vaporslots-release.zip
+            examples/streamer/build/streamer-release.zip
           if-no-files-found: error
 
       # ── Publish GitHub Release (tag pushes only) ──────────────────────────
@@ -130,23 +219,30 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            examples/flappy/build/flappy.bin
-            examples/flappy/build/flappy.hex
-            examples/slots/build/slots.bin
-            examples/slots/build/slots.hex
-            examples/streamer/build/streamer.bin
-            examples/streamer/build/streamer.hex
+            examples/flappy/build/flappyvape-release.zip
+            examples/slots/build/vaporslots-release.zip
+            examples/streamer/build/streamer-release.zip
           body: |
-            ## Vaporware Firmware Binaries
+            ## Vaporware Firmware Releases
 
-            Flash one of the `.bin` files to your N32G031 vape using the
-            matching `flash_vape.bat` script in the repo.
+            Each zip contains everything you need to flash — no build tools required.
 
-            | Firmware | Description |
+            | Zip | Contents |
             |---|---|
-            | `flappy.bin` | FlappyVape — tap-to-flap game |
-            | `slots.bin` | Vaporslots — slot machine |
-            | `streamer.bin` | Streamer — live PC display via SWD |
+            | `flappyvape-release.zip` | FlappyVape firmware + `flash.bat` |
+            | `vaporslots-release.zip` | Vaporslots firmware + `flash.bat` |
+            | `streamer-release.zip` | Streamer firmware + `flash.bat` + `stream_frames.py` |
 
-            See [`examples/streamer/README.md`](examples/streamer/README.md)
-            for streamer setup instructions.
+            ### Requirements
+            - Windows 10/11 with WSL2
+            - [OpenOCD](https://openocd.org) installed in WSL (`sudo apt install openocd`)
+            - [usbipd-win](https://github.com/dorssel/usbipd-win) installed on Windows
+            - ST-Link V2 debugger connected on USB bus ID `1-2`
+              *(run `usbipd list` in PowerShell to confirm — edit `flash.bat` if different)*
+
+            ### Flash Instructions
+            1. Download and unzip the firmware package for the firmware you want
+            2. Plug in your ST-Link with the vape attached and powered on
+            3. Double-click `flash.bat`
+
+            See [`examples/streamer/README.md`](examples/streamer/README.md) for streamer streaming setup.
