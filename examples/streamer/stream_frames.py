@@ -829,7 +829,7 @@ def test_chunk_gen():
     return gen
 
 
-def screen_frames(bbox, posterize=0, smooth_alpha=0.0):
+def screen_frames(bbox, posterize=0, smooth_alpha=0.0, crop=None, rotate=None):
     x, y, w, h = bbox
     if HAS_DXCAM:
         # dxcam uses DXGI Desktop Duplication — captures GPU-composited frames
@@ -861,6 +861,26 @@ def screen_frames(bbox, posterize=0, smooth_alpha=0.0):
                 while not _stop.is_set():
                     shot = _sct.grab(region)
                     img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+                    if crop is not None:
+                        l, t, r, b = crop
+                        iw, ih = img.size
+                        img = img.crop((int(l * iw), int(t * ih), int(r * iw), int(b * ih)))
+                    if rotate is not None:
+                        pre_w = LCD_H if rotate in (90, 270) else LCD_W
+                        pre_h = LCD_W if rotate in (90, 270) else LCD_H
+                        iw, ih = img.size
+                        src_ratio = iw / ih
+                        pre_ratio = pre_w / pre_h
+                        if src_ratio > pre_ratio + 0.01:
+                            new_w = int(ih * pre_ratio)
+                            x_off = (iw - new_w) // 2
+                            img = img.crop((x_off, 0, x_off + new_w, ih))
+                        elif src_ratio < pre_ratio - 0.01:
+                            new_h = int(iw / pre_ratio)
+                            y_off = (ih - new_h) // 2
+                            img = img.crop((0, y_off, iw, y_off + new_h))
+                        img = img.resize((pre_w, pre_h), Image.BILINEAR)
+                        img = img.rotate(rotate, expand=True)
                     chunks = image_to_chunks(img,
                                             posterize=posterize,
                                             smooth_state=_smooth_state,
@@ -1092,7 +1112,9 @@ def main():
             print(f"  Temporal smooth: alpha={args.smooth:.2f} ({args.smooth*100:.0f}% prev frame)")
         frames = screen_frames(bbox,
                                posterize=args.posterize,
-                               smooth_alpha=args.smooth)
+                               smooth_alpha=args.smooth,
+                               crop=args.crop,
+                               rotate=args.rotate)
     elif args.window:
         frames = window_frames(args.window)
     elif args.file:
