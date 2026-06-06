@@ -39,12 +39,14 @@ Protocol (see streamer.c for MCU side):
 
 import argparse
 import os
+import queue
 import random
 import re
 import socket
 import struct
 import subprocess
 import sys
+import threading
 import time
 
 # ── Dependencies check ────────────────────────────────────────────────────────
@@ -121,7 +123,7 @@ def image_to_chunks(img):
     """
     img = img.convert("RGB")
     if img.size != (LCD_W, LCD_H):
-        img = img.resize((LCD_W, LCD_H), Image.LANCZOS)
+        img = img.resize((LCD_W, LCD_H), Image.BILINEAR)
 
     if HAS_NUMPY:
         # Shape: (LCD_H, LCD_W, 3) — dtype uint8
@@ -817,12 +819,34 @@ def screen_frames(bbox):
             camera.stop()
             camera.release()
     elif HAS_MSS:
-        with mss.MSS() as sct:
-            region = {"left": x, "top": y, "width": w, "height": h}
+        # Run mss grab + image_to_chunks in a background thread so the grab
+        # overlaps with the SWD send in the main thread, hiding the ~30ms
+        # capture overhead from the critical path.
+        # Queue depth 1: main thread always gets the latest frame, grab thread
+        # discards any unconsumed frame before putting a new one.
+        _q = queue.Queue(maxsize=1)
+        _stop = threading.Event()
+
+        def _grab_worker():
+            with mss.MSS() as _sct:
+                region = {"left": x, "top": y, "width": w, "height": h}
+                while not _stop.is_set():
+                    shot = _sct.grab(region)
+                    img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
+                    chunks = image_to_chunks(img)
+                    try:
+                        _q.get_nowait()   # discard stale frame if main is slow
+                    except queue.Empty:
+                        pass
+                    _q.put(chunks)
+
+        t = threading.Thread(target=_grab_worker, daemon=True)
+        t.start()
+        try:
             while True:
-                shot = sct.grab(region)
-                img = Image.frombytes("RGB", shot.size, shot.bgra, "raw", "BGRX")
-                yield img
+                yield _q.get()   # blocks until grab thread delivers next frame
+        finally:
+            _stop.set()
     else:
         while True:
             img = ImageGrab.grab(bbox=(x, y, x + w, y + h))
@@ -1045,13 +1069,13 @@ def main():
     frame_idx = 0
     total_time = 0.0
 
-    def _print_stats(elapsed, sent):
+    def _print_stats(elapsed, sent, proc_ms=0.0):
         nonlocal frame_idx, total_time
         total_time += elapsed
         fps = 1.0 / elapsed if elapsed > 0 else 0
         avg_fps = frame_idx / total_time if total_time > 0 else 0
         print(f"\r  frame {frame_idx:4d}  {fps:5.1f} fps  avg {avg_fps:5.1f} fps  "
-              f"sent {sent}/{NUM_CHUNKS}  elapsed {elapsed*1000:.0f}ms  ",
+              f"sent {sent}/{NUM_CHUNKS}  swd {elapsed*1000:.0f}ms  proc {proc_ms*1000:.0f}ms  ",
               end="", flush=True)
         frame_idx += 1
 
@@ -1072,35 +1096,44 @@ def main():
                     _print_stats(elapsed, sent)
 
         if frames is not None:
-            # ── PIL-image frame loop (screen / window / video / numpy fallback) ──
-            for img in frames:
-                if args.crop:
-                    l, t, r, b = args.crop
-                    iw, ih = img.size
-                    img = img.crop((int(l * iw), int(t * ih), int(r * iw), int(b * ih)))
-                if args.rotate:
-                    # Optimised: crop source to pre-rotation aspect ratio, downscale
-                    # to near-final size (80×64 for 90°/270°), THEN rotate the tiny
-                    # image.  Avoids rotating a multi-megapixel frame every tick.
-                    iw, ih = img.size
-                    pre_w = LCD_H if args.rotate in (90, 270) else LCD_W
-                    pre_h = LCD_W if args.rotate in (90, 270) else LCD_H
-                    src_ratio = iw / ih
-                    pre_ratio = pre_w / pre_h
-                    if src_ratio > pre_ratio + 0.01:
-                        new_w = int(ih * pre_ratio)
-                        x_off = (iw - new_w) // 2
-                        img = img.crop((x_off, 0, x_off + new_w, ih))
-                    elif src_ratio < pre_ratio - 0.01:
-                        new_h = int(iw / pre_ratio)
-                        y_off = (ih - new_h) // 2
-                        img = img.crop((0, y_off, iw, y_off + new_h))
-                    img = img.resize((pre_w, pre_h), Image.LANCZOS)
-                    img = img.rotate(args.rotate, expand=True)  # now only 80×64 pixels
-                chunks = image_to_chunks(img)
+            # ── Frame loop (screen / window / video / numpy fallback) ──
+            # screen_frames (mss path) yields pre-converted chunk lists;
+            # all other generators yield PIL Images that need conversion here.
+            for frame in frames:
+                tg0 = time.monotonic()
+                if isinstance(frame, list):
+                    # Pre-converted by the mss grab thread — proc time already hidden.
+                    chunks = frame
+                else:
+                    img = frame
+                    if args.crop:
+                        l, t, r, b = args.crop
+                        iw, ih = img.size
+                        img = img.crop((int(l * iw), int(t * ih), int(r * iw), int(b * ih)))
+                    if args.rotate:
+                        # Optimised: crop source to pre-rotation aspect ratio, downscale
+                        # to near-final size (80×64 for 90°/270°), THEN rotate the tiny
+                        # image.  Avoids rotating a multi-megapixel frame every tick.
+                        iw, ih = img.size
+                        pre_w = LCD_H if args.rotate in (90, 270) else LCD_W
+                        pre_h = LCD_W if args.rotate in (90, 270) else LCD_H
+                        src_ratio = iw / ih
+                        pre_ratio = pre_w / pre_h
+                        if src_ratio > pre_ratio + 0.01:
+                            new_w = int(ih * pre_ratio)
+                            x_off = (iw - new_w) // 2
+                            img = img.crop((x_off, 0, x_off + new_w, ih))
+                        elif src_ratio < pre_ratio - 0.01:
+                            new_h = int(iw / pre_ratio)
+                            y_off = (ih - new_h) // 2
+                            img = img.crop((0, y_off, iw, y_off + new_h))
+                        img = img.resize((pre_w, pre_h), Image.BILINEAR)
+                        img = img.rotate(args.rotate, expand=True)  # now only 80×64 pixels
+                    chunks = image_to_chunks(img)
+                tg1 = time.monotonic()
                 elapsed, sent = disp.send_frame(chunks)
                 time.sleep(random.uniform(0.0, DITHER_S))
-                _print_stats(elapsed, sent)
+                _print_stats(elapsed, sent, tg1 - tg0)
 
     except KeyboardInterrupt:
         print("\nStopped.")
