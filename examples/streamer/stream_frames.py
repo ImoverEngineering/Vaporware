@@ -282,31 +282,33 @@ class VapeDisplay:
             print(f"  WARNING: usbipd attach returned {result.returncode}: {result.stderr.strip()}")
         time.sleep(1.5)
 
-        # Launch OpenOCD in WSL
+        # Launch OpenOCD in WSL, with one automatic retry after a usbipd
+        # detach/attach cycle.  When a previous streamer session dies abruptly,
+        # the ST-Link adapter can be left with stale internal state that makes
+        # OpenOCD report "init mode failed (unable to connect to target)".
+        # Cycling the USB attachment resets the adapter without touching the MCU
+        # or battery, reliably clearing the lockup.
         print("  Starting OpenOCD in WSL…")
-        # Override stm32f0x_default_reset_init before loading n32g0x.cfg.
-        # That hook boosts SYSCLK to 48 MHz while the MCU is halted.  When
-        # firmware then runs clock_init() it assumes 8 MHz and sets TIM3
-        # PSC=7, making all delays 6× too short.  The GC9107 Sleep Out wait
-        # (nominally 120 ms) becomes ~20 ms and the display never wakes.
-        # Overriding the proc to a no-op keeps the MCU at 8 MHz HSI so
-        # the firmware's own clock_boost_48mhz() runs correctly after display_init.
         ocd_cmd = (
             f'openocd -f {OCD_TARGET_CFG} '
             f'-c "init" '
             f'-c "reset halt"'
         )
-        # stdin=PIPE prevents OpenOCD from reading the parent's stdin.
-        # Without this, if the parent's stdin is a closed pipe (common in
-        # scripted/automated contexts), OpenOCD reads EOF and shuts itself
-        # down within seconds of starting.  Keeping an open write-end alive
-        # makes OpenOCD stay in server mode indefinitely.
-        self._ocd_proc = subprocess.Popen(
-            ['wsl', '-u', 'root', 'bash', '-c', ocd_cmd],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
+
+        def _launch_ocd():
+            # stdin=PIPE prevents OpenOCD from reading the parent's stdin.
+            # Without this, if the parent's stdin is a closed pipe (common in
+            # scripted/automated contexts), OpenOCD reads EOF and shuts itself
+            # down within seconds of starting.  Keeping an open write-end alive
+            # makes OpenOCD stay in server mode indefinitely.
+            return subprocess.Popen(
+                ['wsl', '-u', 'root', 'bash', '-c', ocd_cmd],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+
+        self._ocd_proc = _launch_ocd()
 
         # Wait for OpenOCD to connect to target and open telnet port.
         # n32g0x.cfg runs init + reset halt before the server loop starts;
@@ -317,14 +319,32 @@ class VapeDisplay:
         print("  Connecting to OpenOCD telnet…")
         rc = self._ocd_proc.poll()
         if rc is not None:
+            # OpenOCD exited — likely stale ST-Link adapter state.  Cycle the
+            # USB attachment (detach → re-attach) to reset the adapter, then retry once.
+            print("  OpenOCD failed — cycling ST-Link USB to recover adapter state…")
             try:
-                log = subprocess.run(
-                    ['wsl', 'cat', '/tmp/openocd_stream.log'],
-                    capture_output=True, text=True, timeout=3
-                ).stdout
+                self._ocd_proc.terminate()
             except Exception:
-                log = "(log unavailable)"
-            raise RuntimeError(f"OpenOCD exited early (rc={rc}):\n{log}")
+                pass
+            subprocess.run(['usbipd', 'detach', '--busid', USBIPD_BUSID],
+                           capture_output=True)
+            time.sleep(2.0)
+            subprocess.run(['usbipd', 'attach', '--wsl', '--busid', USBIPD_BUSID],
+                           capture_output=True)
+            time.sleep(2.0)
+            print("  Retrying OpenOCD…")
+            self._ocd_proc = _launch_ocd()
+            time.sleep(5.0)
+            rc = self._ocd_proc.poll()
+            if rc is not None:
+                try:
+                    log = subprocess.run(
+                        ['wsl', 'cat', '/tmp/openocd_stream.log'],
+                        capture_output=True, text=True, timeout=3
+                    ).stdout
+                except Exception:
+                    log = "(log unavailable)"
+                raise RuntimeError(f"OpenOCD exited early after USB cycle (rc={rc}):\n{log}")
         self._sock = socket.create_connection(('localhost', OCD_TELNET_PORT), timeout=5)
         self._sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)  # no Nagle buffering
         self._sock.settimeout(15)
