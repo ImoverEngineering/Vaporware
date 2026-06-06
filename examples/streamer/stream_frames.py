@@ -440,14 +440,25 @@ class VapeDisplay:
                   f'wait={1000*(t3-t2):.1f}ms  sleep=9.0ms  '
                   f'total={1000*(t4-t0):.1f}ms')
 
+    # Force a full redraw every N frames so display-side artifacts (from SWD
+    # glitches, MCU resets, or load_image races) can't get permanently stuck.
+    # At ~27fps avg this clears any artifact within ~1 second.
+    _FORCE_REFRESH_INTERVAL = 30
+    _frame_count = 0
+
     def send_frame(self, chunks):
         """Send all changed chunks. Returns (elapsed_seconds, chunks_sent).
 
-        5-chunk mode: ~13ms/chunk → ~15fps for full-frame updates (vs ~8fps
-        with 10 chunks).  Delta skipping means static content runs faster.
+        Delta-skips unchanged chunks for speed, but forces a full refresh every
+        _FORCE_REFRESH_INTERVAL frames to prevent stuck artifacts on the display.
         """
         t0 = time.monotonic()
         chunks_sent = 0
+
+        # Periodic forced full refresh: invalidate cache so every chunk is resent.
+        self._frame_count += 1
+        if self._frame_count % self._FORCE_REFRESH_INTERVAL == 0:
+            self._prev_chunks = [None] * NUM_CHUNKS
 
         # Write chunks in REVERSED order (4→0) to match the GC9107 scan direction.
         # MADCTL=0x98 → ML=1 → gate scan runs GRAM row 159→0, i.e. chunk 4→0.
@@ -482,6 +493,11 @@ class VapeDisplay:
         frame_t = time.monotonic()   # shared timestamp — same for every chunk
         t0 = frame_t
         chunks_sent = 0
+
+        self._frame_count += 1
+        if self._frame_count % self._FORCE_REFRESH_INTERVAL == 0:
+            self._prev_chunks = [None] * NUM_CHUNKS
+
         for idx in range(NUM_CHUNKS - 1, -1, -1):
             chunk = chunk_gen(idx, frame_t)
             if chunk == self._prev_chunks[idx]:
