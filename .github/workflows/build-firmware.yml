@@ -1,0 +1,152 @@
+name: Build Firmware
+
+on:
+  push:
+    branches: ["main"]
+    tags: ["v*"]
+  pull_request:
+    branches: ["main"]
+
+jobs:
+  build:
+    name: Build all firmware
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install ARM GNU Toolchain
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y gcc-arm-none-eabi binutils-arm-none-eabi
+
+      # ── FlappyVape ─────────────────────────────────────────────────────────
+      - name: Build FlappyVape
+        working-directory: examples/flappy
+        run: |
+          mkdir -p build
+          VAPORWARE=../../src
+          GCC=arm-none-eabi-gcc
+          OBJCOPY=arm-none-eabi-objcopy
+          CPU="-mcpu=cortex-m0 -mthumb"
+          CFLAGS="$CPU -I$VAPORWARE/include -Os -ffunction-sections -fdata-sections -Wall -std=c11"
+
+          $GCC $CPU -x assembler-with-cpp -c $VAPORWARE/src/startup.s -o build/startup.o
+          $GCC $CFLAGS -c $VAPORWARE/src/system.c  -o build/system.o
+          $GCC $CFLAGS -c $VAPORWARE/src/display.c -o build/display.o
+          $GCC $CFLAGS -c $VAPORWARE/src/vape.c    -o build/vape.o
+          $GCC $CFLAGS -c $VAPORWARE/src/button.c  -o build/button.o
+          $GCC $CFLAGS -c $VAPORWARE/src/battery.c -o build/battery.o
+          $GCC $CFLAGS -c $VAPORWARE/src/nv.c      -o build/nv.o
+          $GCC $CFLAGS -c $VAPORWARE/src/app.c     -o build/app.o
+          $GCC $CFLAGS -c src/flappy.c             -o build/flappy.o
+
+          $GCC $CPU -T$VAPORWARE/n32g031.ld -Wl,--gc-sections -nostdlib -lnosys \
+            build/startup.o build/system.o build/display.o build/vape.o \
+            build/button.o build/battery.o build/nv.o build/app.o \
+            build/flappy.o \
+            -o build/flappy.elf
+
+          $OBJCOPY -O binary build/flappy.elf build/flappy.bin
+          $OBJCOPY -O ihex   build/flappy.elf build/flappy.hex
+          arm-none-eabi-size build/flappy.elf
+
+      # ── Vaporslots ─────────────────────────────────────────────────────────
+      - name: Build Vaporslots
+        working-directory: examples/slots
+        run: |
+          mkdir -p build
+          VAPORWARE=../../src
+          GCC=arm-none-eabi-gcc
+          OBJCOPY=arm-none-eabi-objcopy
+          CPU="-mcpu=cortex-m0 -mthumb"
+          CFLAGS="$CPU -I$VAPORWARE/include -Iinclude -Os -ffunction-sections -fdata-sections -Wall -std=c11"
+
+          $GCC $CPU -x assembler-with-cpp -c $VAPORWARE/src/startup.s -o build/startup.o
+          $GCC $CFLAGS -c $VAPORWARE/src/system.c  -o build/system.o
+          $GCC $CFLAGS -c $VAPORWARE/src/display.c -o build/display.o
+          $GCC $CFLAGS -c $VAPORWARE/src/vape.c    -o build/vape.o
+          $GCC $CFLAGS -c $VAPORWARE/src/button.c  -o build/button.o
+          $GCC $CFLAGS -c $VAPORWARE/src/battery.c -o build/battery.o
+          $GCC $CFLAGS -c $VAPORWARE/src/nv.c      -o build/nv.o
+          $GCC $CFLAGS -c $VAPORWARE/src/app.c     -o build/app.o
+          $GCC $CFLAGS -c src/slots.c              -o build/slots.o
+          $GCC $CFLAGS -c src/main.c               -o build/main.o
+
+          $GCC $CPU -T$VAPORWARE/n32g031.ld -Wl,--gc-sections -nostdlib -lnosys \
+            build/startup.o build/system.o build/display.o build/vape.o \
+            build/button.o build/battery.o build/nv.o build/app.o \
+            build/slots.o build/main.o \
+            -o build/slots.elf
+
+          $OBJCOPY -O binary build/slots.elf build/slots.bin
+          $OBJCOPY -O ihex   build/slots.elf build/slots.hex
+          arm-none-eabi-size build/slots.elf
+
+      # ── Streamer ───────────────────────────────────────────────────────────
+      - name: Build Streamer
+        working-directory: examples/streamer
+        run: |
+          mkdir -p build
+          VAPORWARE=../../src
+          GCC=arm-none-eabi-gcc
+          OBJCOPY=arm-none-eabi-objcopy
+          CPU="-mcpu=cortex-m0 -mthumb"
+          CFLAGS="$CPU -I$VAPORWARE/include -Os -ffunction-sections -fdata-sections -Wall -std=c11"
+
+          $GCC $CPU -x assembler-with-cpp -c src/startup.s   -o build/startup.o
+          $GCC $CFLAGS -c $VAPORWARE/src/system.c  -o build/system.o
+          $GCC $CFLAGS -c $VAPORWARE/src/display.c -o build/display.o
+          $GCC $CFLAGS -c $VAPORWARE/src/battery.c -o build/battery.o
+          $GCC $CFLAGS -c src/streamer.c           -o build/streamer.o
+
+          $GCC $CPU -Tn32g031.ld -Wl,--gc-sections -nostdlib -lnosys \
+            build/startup.o build/system.o build/display.o build/battery.o \
+            build/streamer.o \
+            -o build/streamer.elf
+
+          $OBJCOPY -O binary build/streamer.elf build/streamer.bin
+          $OBJCOPY -O ihex   build/streamer.elf build/streamer.hex
+          arm-none-eabi-size build/streamer.elf
+
+      # ── Upload build artifacts (every run) ────────────────────────────────
+      - name: Upload firmware artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: vaporware-firmware
+          path: |
+            examples/flappy/build/flappy.bin
+            examples/flappy/build/flappy.hex
+            examples/slots/build/slots.bin
+            examples/slots/build/slots.hex
+            examples/streamer/build/streamer.bin
+            examples/streamer/build/streamer.hex
+          if-no-files-found: error
+
+      # ── Publish GitHub Release (tag pushes only) ──────────────────────────
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            examples/flappy/build/flappy.bin
+            examples/flappy/build/flappy.hex
+            examples/slots/build/slots.bin
+            examples/slots/build/slots.hex
+            examples/streamer/build/streamer.bin
+            examples/streamer/build/streamer.hex
+          body: |
+            ## Vaporware Firmware Binaries
+
+            Flash one of the `.bin` files to your N32G031 vape using the
+            matching `flash_vape.bat` script in the repo.
+
+            | Firmware | Description |
+            |---|---|
+            | `flappy.bin` | FlappyVape — tap-to-flap game |
+            | `slots.bin` | Vaporslots — slot machine |
+            | `streamer.bin` | Streamer — live PC display via SWD |
+
+            See [`examples/streamer/README.md`](examples/streamer/README.md)
+            for streamer setup instructions.
