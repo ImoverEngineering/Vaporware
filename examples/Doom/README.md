@@ -1,0 +1,181 @@
+# Doom Ultra Lite for RAZ Vape
+
+`Doom Ultra Lite` is a tiny one-button, doom gallery shooter built for the Vaporware SDK and the Raz LTX 25000(Raz DAZ 250000) / N32G031K8Q7-1 vape target.
+
+Since RAZ LTX 25000 only has 64 KB flash / 8 KB SRAM that was too small for even pure doom wad, this is a one hallway doom shooter with some features.
+
+## What It Does
+
+- Shows the Doom title screen
+- Auto-moves the player through a corridor
+- Spawns multiple enemy types plus a periodic boss encounter
+- Tracks health, ammo, reload state, win, and death screens
+- Uses prebuilt 4bpp art assets for the title, enemies, and death screen
+
+## Controls
+
+- Title screen: press the button to start
+- In game: tap the button to shoot
+- In game: hold the button to slow movement for a strafe/turn feel
+- Win or death screen: press the button to return to the title screen
+- Safety escape: hold the button for about 10 seconds to jump back to the title screen
+
+
+## Files
+
+| File | Purpose |
+|---|---|
+| `src/main.c` | Main game logic, rendering, controls, and state machine |
+| `src/doom_title_letterbox.c` | Title screen image asset and draw routine |
+| `src/doom_enemy_sprites.c` | Enemy sprite sheet converted into indexed C data |
+| `src/doom_deathscreen.c` | Doom-style death screen asset and draw routine |
+| `build_doom.bat` / `build_doom.sh` | Build scripts for Windows and Linux |
+| `gen_direct_flash.py` | Converts `build/doom.bin` into `direct_flash.tcl` |
+| `flash_vape.bat` / `flash_doom.sh` | OpenOCD flashing helpers |
+
+## Build
+
+This example lives under `Vaporware/examples/Doom` and builds against the shared SDK in `Vaporware/src`.
+
+### Host Setup Notes
+
+### Linux host
+
+Use this path if your main development machine is Linux.
+
+- Install Arm GNU Toolchain so `arm-none-eabi-gcc`, `arm-none-eabi-objcopy`, and `arm-none-eabi-size` are available on `PATH`
+- Use `python3` for `gen_direct_flash.py`
+- If you plan to flash from Linux, install `openocd` on the Linux host as well
+
+### Windows host with WSL
+
+Use this path if your main development machine is Windows.
+
+- `build_doom.bat` runs from normal Windows `cmd.exe`
+- `flash_vape.bat` is not pure Windows: it calls `wsl openocd ...`, so you need a working WSL install for the flashing step
+- You also need `usbipd` on Windows so the ST-Link can be attached into WSL
+- Install `openocd` inside WSL, not just on the Windows side
+- Keep in mind that the batch file currently assumes the Arm GNU Toolchain is installed in the default Windows path shown below
+
+### Windows build
+
+From Command Prompt:
+
+```cmd
+cd Vaporware\examples\Doom
+build_doom.bat
+```
+
+Expected output:
+
+```text
+build\doom.bin
+build\doom.elf
+build\doom.hex
+build\doom.map
+```
+
+`build_doom.bat` assumes Arm GNU Toolchain 14.2 is installed at:
+
+```text
+C:\Program Files (x86)\Arm GNU Toolchain arm-none-eabi\14.2 rel1\bin\
+```
+
+If your toolchain is somewhere else, update the `GCC`, `OBJCOPY`, and `SIZE` variables at the top of the batch file.
+
+### Linux build
+
+From a shell:
+
+```bash
+cd Vaporware/examples/Doom
+./build_doom.sh
+```
+
+The script expects `arm-none-eabi-gcc`, `arm-none-eabi-objcopy`, and `arm-none-eabi-size` to be on `PATH`. You can also override them inline:
+
+```bash
+CC=/path/to/arm-none-eabi-gcc \
+OBJCOPY=/path/to/arm-none-eabi-objcopy \
+SIZE=/path/to/arm-none-eabi-size \
+./build_doom.sh
+```
+
+## Flashing
+
+### Windows helper flow
+
+```cmd
+cd Vaporware\examples\Doom
+python gen_direct_flash.py
+flash_vape.bat
+```
+
+`flash_vape.bat`:
+
+- checks that `build\doom.bin` exists
+- checks that `direct_flash.tcl` exists
+- wakes WSL and fails early if WSL is unavailable
+- attaches the ST-Link into WSL with `usbipd`
+- runs OpenOCD inside WSL with `n32g031.openocd.cfg`
+
+The batch file currently hardcodes `usbipd attach --wsl --busid 1-2`, so change that bus ID if your ST-Link shows up differently on your machine.
+
+### Linux / WSL helper flow
+
+```bash
+cd Vaporware/examples/Doom
+python3 gen_direct_flash.py
+./flash_doom.sh
+```
+
+`flash_doom.sh` runs OpenOCD directly and expects `direct_flash.tcl` plus `build/doom.bin` to already exist.
+
+### Tigard manual OpenOCD flow
+
+If you are using a Tigard instead of an ST-Link, you can flash Doom manually with the Tigard SWD and target config files that now live in `examples/Doom`.
+
+Build and generate the flash script first:
+
+```bash
+cd Vaporware/examples/Doom
+bash build_doom.sh
+python3 gen_direct_flash.py
+```
+
+Then start OpenOCD in a separate terminal:
+
+```bash
+sudo openocd -f tigard-swd.cfg -f n32g0x.cfg
+```
+
+Open a telnet session to the OpenOCD server:
+
+```bash
+telnet localhost 4444
+```
+
+Run these OpenOCD commands inside the telnet session:
+
+```text
+init
+reset halt
+source direct_flash.tcl
+reset run
+shutdown
+```
+
+Notes:
+
+- Both `tigard-swd.cfg` and `n32g0x.cfg` are expected to be in `Vaporware/examples/Doom`
+- Do not disable `telnet_port` before connecting, or the `telnet localhost 4444` step will fail
+- If you prefer a one-shot command instead of telnet, you can pass `-c "source ..."` and `-c "exit"` directly to `openocd`
+
+
+## Notes
+
+- The game is intentionally simple and uses broad shapes plus low-frame-rate animation to fit the hardware
+- Rendering targets the 128x160 GC9107 display used by the Vaporware platform
+- This example uses the Vaporware app framework, button handling, display driver, battery support, and startup code from `../../src`
+- the vape function of the vape will stop working since you know, we took over a large chuck of the vapes storage. 
+- A Tirgard was used to interact with the vape, I can't confirm if the SP-link will work.  
